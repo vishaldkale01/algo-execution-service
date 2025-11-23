@@ -1,0 +1,8 @@
+motor
+python-dotenv
+httpx
+pydantic
+protobuf
+websockets
+upstox-python-sdk
+redis
