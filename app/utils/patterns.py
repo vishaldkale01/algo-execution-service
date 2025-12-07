@@ -32,6 +32,7 @@ def identify_candlestick_patterns(candles: List[Dict[str, Any]]) -> List[Dict[st
         if is_shooting_star(current):
             patterns.append({"timestamp": current['timestamp'], "pattern": "Shooting Star"})
         if is_engulfing(current, previous):
-            patterns.append({"timestamp": current['timestamp'], "pattern": "Engulfing"})
+            pattern_name = "Bullish Engulfing" if current['close'] > current['open'] else "Bearish Engulfing"
+            patterns.append({"timestamp": current['timestamp'], "pattern": pattern_name})
 
     return patterns

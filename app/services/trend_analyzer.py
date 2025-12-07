@@ -1,6 +1,9 @@
 from typing import List, Dict, Any
 from datetime import datetime
+import pandas as pd
+import pandas_ta as ta
 from app.models.trade import VirtualTrade, TradeType, TradeStatus
+from app.utils.patterns import identify_candlestick_patterns
 from app.database import get_database
 
 # Cache for recent calculations
@@ -26,109 +29,6 @@ SCALPING_CONFIG = {
     }
 }
 
-
-def calculate_ema(prices: List[float], period: int) -> float:
-    """Calculate Exponential Moving Average"""
-    if len(prices) < period:
-        return prices[-1] if prices else 0
-    
-    k = 2 / (period + 1)
-    ema = prices[0]
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-
-def calculate_rsi(prices: List[float], period: int = 14) -> float:
-    """Calculate Relative Strength Index"""
-    if len(prices) < period + 1:
-        return 50
-    
-    avg_gain = 0
-    avg_loss = 0
-    
-    # Initial RSI calculation
-    for i in range(1, period + 1):
-        diff = prices[i] - prices[i - 1]
-        if diff > 0:
-            avg_gain += diff
-        else:
-            avg_loss -= diff
-    
-    avg_gain /= period
-    avg_loss /= period
-    
-    # Wilder's smoothing
-    for i in range(period + 1, len(prices)):
-        diff = prices[i] - prices[i - 1]
-        avg_gain = (avg_gain * 13 + (diff if diff > 0 else 0)) / 14
-        avg_loss = (avg_loss * 13 + (-diff if diff < 0 else 0)) / 14
-    
-    if avg_loss == 0:
-        return 100
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def calculate_macd(prices: List[float]) -> float:
-    """Calculate MACD"""
-    ema12 = calculate_ema(prices, 12)
-    ema26 = calculate_ema(prices, 26)
-    return ema12 - ema26
-
-
-def calculate_supertrend(candles: List[Dict], period: int = 10, multiplier: int = 3) -> Dict:
-    """Calculate SuperTrend indicator"""
-    highs = [c['high'] for c in candles]
-    lows = [c['low'] for c in candles]
-    closes = [c['close'] for c in candles]
-    
-    # Calculate ATR
-    tr = []
-    for i, h in enumerate(highs):
-        if i == 0:
-            tr.append(h - lows[i])
-        else:
-            previous_close = closes[i - 1]
-            tr.append(max(
-                h - lows[i],
-                abs(h - previous_close),
-                abs(lows[i] - previous_close)
-            ))
-    
-    atr = sum(tr[-period:]) / period
-    
-    # Current SuperTrend
-    current_close = closes[-1]
-    upper_band = current_close + (multiplier * atr)
-    lower_band = current_close - (multiplier * atr)
-    
-    return {
-        "upperBand": upper_band,
-        "lowerBand": lower_band,
-        "trend": "UP" if current_close > lower_band else "DOWN"
-    }
-
-
-def calculate_momentum(prices: List[float], period: int = 10) -> float:
-    """Calculate price momentum"""
-    if len(prices) < period:
-        return 0
-    return ((prices[-1] - prices[-period]) / prices[-period]) * 100
-
-
-def calculate_velocity(prices: List[float], period: int = 5) -> float:
-    """Calculate price velocity (rate of change)"""
-    if len(prices) < period:
-        return 0
-    
-    changes = []
-    for i in range(1, period):
-        changes.append(prices[-i] - prices[-i - 1])
-    
-    return sum(changes) / period
 
 
 def analyze_price_action(candles: List[Dict]) -> str:
@@ -181,29 +81,76 @@ def analyze_volume(candles: List[Dict]) -> Dict:
 
 
 def analyze_scalping_signals(candles: List[Dict], current_price: float) -> Dict:
-    """Analyze scalping signals from candle data"""
-    prices = [c['close'] for c in candles]
+    """Analyze scalping signals from candle data using pandas-ta"""
+    if not candles:
+        return {}
+        
+    # Convert to DataFrame
+    df = pd.DataFrame(candles)
     
-    # Short-term indicators
-    ema9 = calculate_ema(prices, 9)
-    ema20 = calculate_ema(prices, 20)
-    rsi = calculate_rsi(prices, 14)
-    supertrend = calculate_supertrend(candles)
-    momentum = calculate_momentum(prices)
-    velocity = calculate_velocity(prices)
+    # Ensure numeric columns
+    cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in cols:
+        df[col] = pd.to_numeric(df[col])
+        
+    # Calculate Indicators
+    # EMA
+    df['ema9'] = df.ta.ema(length=9)
+    df['ema20'] = df.ta.ema(length=20)
     
-    # Price action analysis
+    # RSI
+    df['rsi'] = df.ta.rsi(length=14)
+    
+    # SuperTrend (returns SUPERT_10_3.0, SUPERTd_10_3.0, SUPERTl_10_3.0, SUPERTs_10_3.0)
+    st = df.ta.supertrend(length=10, multiplier=3)
+    
+    # Check if SuperTrend calculation was successful
+    if st is not None:
+        df = df.join(st)
+        # Identify the direction column (usually SUPERTd_10_3.0)
+        st_dir_col = f"SUPERTd_10_3.0"
+    else:
+        # Fallback if not enough data
+        st_dir_col = None
+
+    # Momentum (ROC - Rate of Change)
+    df['momentum'] = df.ta.roc(length=10)
+    
+    # Velocity (Average change over 5 periods)
+    df['velocity'] = df['close'].diff().rolling(window=5).mean()
+
+    # Get latest values
+    last = df.iloc[-1]
+    
+    # Determine SuperTrend direction
+    # pandas-ta returns 1 for UP, -1 for DOWN
+    if st_dir_col and st_dir_col in last:
+        st_val = last[st_dir_col]
+        st_trend = "UP" if st_val == 1 else "DOWN"
+    else:
+        st_trend = "NEUTRAL"
+
+    # Price action analysis (keep existing function call)
     price_action = analyze_price_action(candles)
     
+    # Candlestick patterns
+    patterns = identify_candlestick_patterns(candles)
+    latest_pattern = patterns[-1]['pattern'] if patterns else "NONE"
+
+    # Handle NaN values safely
+    def get_val(val, default=0):
+        return val if pd.notna(val) else default
+
     return {
-        "ema": "BULLISH" if ema9 > ema20 else "BEARISH",
-        "supertrend": supertrend["trend"],
-        "rsi": rsi,
-        "momentum": momentum,
-        "velocity": velocity,
+        "ema": "BULLISH" if get_val(last['ema9']) > get_val(last['ema20']) else "BEARISH",
+        "supertrend": st_trend,
+        "rsi": get_val(last['rsi'], 50),
+        "momentum": get_val(last['momentum']),
+        "velocity": get_val(last['velocity']),
         "priceAction": price_action,
-        "ema9Value": ema9,
-        "ema20Value": ema20
+        "pattern": latest_pattern,
+        "ema9Value": get_val(last['ema9']),
+        "ema20Value": get_val(last['ema20'])
     }
 
 
@@ -533,10 +480,20 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
                 trade_type = 'CALL' if (signals['supertrend'] == 'UP' and signals['ema'] == 'BULLISH') else 'PUT'
                 
                 # Validation
+                # Check for supportive patterns
+                bullish_patterns = ['Hammer', 'Bullish Engulfing']
+                bearish_patterns = ['Shooting Star', 'Bearish Engulfing']
+                
                 valid = (
                     current_price > 0 and
-                    ((trade_type == 'CALL' and signals['ema'] == 'BULLISH' and signals['supertrend'] == 'UP') or
-                     (trade_type == 'PUT' and signals['ema'] == 'BEARISH' and signals['supertrend'] == 'DOWN'))
+                    ((trade_type == 'CALL' and 
+                      signals['ema'] == 'BULLISH' and 
+                      signals['supertrend'] == 'UP' and
+                      (signals['pattern'] in bullish_patterns or signals['priceAction'] in ['BREAKOUT', 'STRONG_BULL'])) or
+                     (trade_type == 'PUT' and 
+                      signals['ema'] == 'BEARISH' and 
+                      signals['supertrend'] == 'DOWN' and
+                      (signals['pattern'] in bearish_patterns or signals['priceAction'] in ['BREAKDOWN', 'STRONG_BEAR'])))
                 )
                 
                 if valid:

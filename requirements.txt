@@ -6,3 +6,5 @@ protobuf
 websockets
 upstox-python-sdk
 redis
+pandas
+pandas_ta
