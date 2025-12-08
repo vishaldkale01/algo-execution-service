@@ -406,6 +406,7 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
     if 'feeds' not in data:
         return
     
+    print("data:", data)
     # Default config if none provided
     user_config = config or {}
     trade_mode = user_config.get("trade_mode", "VIRTUAL") # VIRTUAL or LIVE
@@ -422,7 +423,7 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
                 continue
             
             current_price = index_ff['ltpc']['ltp']
-            
+            print("current_price:", current_price)
             # Process candles
             candles = []
             for c in index_ff['marketOHLC']['ohlc']:
@@ -436,7 +437,7 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
                         'volume': float(c.get('volume', 0)),
                         'interval': c['interval']
                     })
-            
+            print("candles:", candles)
             candles.sort(key=lambda x: x['timestamp'])
             
             # Store candles (User specific storage would be better, but using global for now)
@@ -465,13 +466,18 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
             
             # Analyze signals
             signals = analyze_scalping_signals(unique_candles, current_price)
+            print("signals:", signals)
             volume_data = analyze_volume(unique_candles)
+            print("volume_data:", volume_data)
             confidence = calculate_scalping_confidence(signals, volume_data['ratio'])
+            print("confidence:", confidence)
             
             # Check conditions
             # Pass user_id to check if THIS user has an open trade
             can_trade = await should_open_new_trade(symbol, user_id)
+            print("can_trade:", can_trade)
             signals_consistent = validate_signal_consistency(symbol, signals)
+            print("signals_consistent:", signals_consistent)
             
             # Execute trade if conditions met
             if (confidence >= SCALPING_CONFIG['minConfidence'] and 
@@ -522,7 +528,7 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
                     
                     # LIVE TRADE EXECUTION
                     if trade_mode == "LIVE" and access_token:
-                        order_id = await place_live_order(new_trade, user_id, access_token)
+                        # order_id = await place_live_order(new_trade, user_id, access_token)
                         if order_id:
                             new_trade["order_id"] = order_id
                             new_trade["status"] = "OPEN" # Confirmed

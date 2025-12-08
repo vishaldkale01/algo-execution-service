@@ -15,7 +15,7 @@ class UpstoxWebSocket:
         
     async def get_market_feed_url(self):
         """Get authorized WebSocket URL from Upstox API"""
-        url = "https://api.upstox.com/v2/feed/market-data-feed/authorize"
+        url = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.access_token}"
@@ -39,17 +39,31 @@ class UpstoxWebSocket:
             "Authorization": f"Bearer {self.access_token}"
         }
         
-        self.ws = await websockets.connect(
-            self.ws_url,
-            extra_headers=headers
-        )
-        
-        print(f"WebSocket connected successfully for user {self.user_id}")
+        try:
+            # Explicitly import connect to ensure we use the asyncio implementation
+            from websockets.asyncio.client import connect as ws_connect
+            import websockets
+            print(f"DEBUG: websockets version: {websockets.version}, file: {websockets.__file__}")
+            print(f"DEBUG: Connecting to {self.ws_url} with headers: {headers}")
+            
+            self.ws = await ws_connect(
+                self.ws_url,
+                additional_headers=headers
+            )
+            
+            print(f"WebSocket connected successfully for user {self.user_id}")
+        except TypeError as e:
+            print(f"DEBUG: TypeError during connect: {e}")
+            # If additional_headers fails, try extra_headers as fallback (unlikely for v15 but checking)
+            if "extra_headers" in str(e):
+                print("DEBUG: Retrying with extra_headers as fallback logic (debugging only)")
+                # This path is actually expected to fail on v15 but shows intent
+            raise e
         
         # Subscribe to instruments
         # Use symbols from config if available, else default
         symbols = self.config.get("symbols", ["NSE_INDEX|Nifty Bank", "NSE_INDEX|Nifty 50"])
-        
+        print("symbols:", symbols)
         subscription_data = {
             "guid": "someguid",
             "method": "sub",
@@ -72,8 +86,9 @@ class UpstoxWebSocket:
                     # Upstox sends protobuf encoded binary data
                     if isinstance(message, bytes):
                         # Decode protobuf message
+                        print("message:", message)
                         decoded_data = decode_message(message)
-                        
+                        print("decoded_data:", decoded_data)
                         if decoded_data:
                             # Analyze the decoded market data with user context
                             await analyze_trend(decoded_data, self.user_id, self.config)
