@@ -1,63 +1,56 @@
-"""
-Protobuf decoder for Upstox WebSocket market data feed.
-This module handles decoding of binary protobuf messages from Upstox WebSocket.
-"""
+# load_proto.py
 
-from google.protobuf.json_format import MessageToDict
+from google.protobuf import descriptor_pb2
+from google.protobuf import descriptor_pool
+from google.protobuf.message_factory import GetMessageClass
+import os
 
 
-class ProtobufDecoder:
+class ProtoLoader:
+    """
+    Loads compiled .desc protobuf dynamically and returns message classes.
+    """
+
     def __init__(self):
-        self.feed_response_class = None
-        self._initialize_protobuf()
+        self.pool = descriptor_pool.Default()
 
-    def _initialize_protobuf(self):
-        """Initialize protobuf message classes from .proto file"""
-        try:
-            # Relative import from the same package: app/services
-            from . import MarketDataFeed_pb2
-            self.feed_response_class = MarketDataFeed_pb2.FeedResponse
-            print("Protobuf decoder initialized successfully")
-            print(MarketDataFeed_pb2)
-            # print response
-            print("response class:", self.feed_response_class)
-        except ImportError as e:
-            print("IMPORT ERROR while loading MarketDataFeed_pb2:", e)
-            print("WARNING: Protobuf classes not generated or import path wrong.")
-            self.feed_response_class = None
-        except Exception as e:
-            print(f"Error initializing protobuf: {e}")
-            self.feed_response_class = None
+    # ------------------------------------------------------
+    def load_proto_file(self, proto_path: str):
+        """
+        Load a compiled descriptor_set (.desc file)
+        """
+        if not os.path.exists(proto_path):
+            raise FileNotFoundError(f"Descriptor file not found: {proto_path}")
 
-    def decode(self, binary_data: bytes) -> dict:
-        """Decode binary protobuf message to Python dictionary"""
-        if not self.feed_response_class:
-            print("Protobuf decoder not initialized")
-            return None
+        fdset = descriptor_pb2.FileDescriptorSet()
 
-        try:
-            msg = self.feed_response_class()
-            msg.ParseFromString(binary_data)
-            print("decoded message:", msg)
-            return MessageToDict(msg, preserving_proto_field_name=True)
-        except Exception as e:
-            print(f"Error decoding protobuf message: {e}")
-            return None
+        with open(proto_path, "rb") as f:
+            fdset.ParseFromString(f.read())
+
+        for fd_proto in fdset.file:
+            self.pool.Add(fd_proto)
+
+        return True
+
+    # ------------------------------------------------------
+    def get_message_class(self, full_name: str):
+        """
+        Returns Python message class dynamically.
+        """
+        descriptor = self.pool.FindMessageTypeByName(full_name)
+        return GetMessageClass(descriptor)
 
 
-# Global decoder instance
-_decoder: ProtobufDecoder | None = None
+# ---------------------------------------------------------
+# DEMO
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    loader = ProtoLoader()
 
+    loader.load_proto_file("market.desc")
 
-def get_decoder() -> ProtobufDecoder:
-    """Get or create global protobuf decoder instance"""
-    global _decoder
-    if _decoder is None:
-        _decoder = ProtobufDecoder()
-    return _decoder
+    FeedResponse = loader.get_message_class(
+        "com.upstox.marketdatafeeder.rpc.proto.FeedResponse"
+    )
 
-
-def decode_message(binary_data: bytes) -> dict:
-    """Convenience function to decode protobuf message"""
-    decoder = get_decoder()
-    return decoder.decode(binary_data)
+    print("Loaded:", FeedResponse)

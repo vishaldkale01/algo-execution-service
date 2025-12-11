@@ -1,153 +1,175 @@
 import asyncio
-import websockets
 import json
-from app.config import settings
-import httpx
-from app.services.trend_analyzer import analyze_trend
+import upstox_client
+from upstox_client.rest import ApiException
+
 
 class UpstoxWebSocket:
     def __init__(self, access_token: str, user_id: str = None, config: dict = None):
+        """
+        access_token: Upstox OAuth Access Token
+        user_id: Optional custom user id (for multi-user setups)
+        config: { symbols: ["NSE_INDEX|Nifty 50", ...] }
+        """
         self.access_token = access_token
         self.user_id = user_id
         self.config = config or {}
-        self.ws_url = None
-        self.ws = None
-        
-    async def get_market_feed_url(self):
-        """Get authorized WebSocket URL from Upstox API"""
-        url = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self.access_token}",
-            "Api-Version": "3.0"  # ✅ Add Api-Version header
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers)
-            
-        if response.status_code == 200:
-            data = response.json()
-            # ✅ Check for correct field name (might be authorized_redirect_uri)
-            ws_url = data["data"].get("authorizedRedirectUri") or data["data"].get("authorized_redirect_uri")
-            return ws_url
-        else:
-            raise Exception(f"Failed to get WebSocket URL: {response.text}")
-    
-    async def connect(self):
-        """Establish WebSocket connection"""
-        self.ws_url = await self.get_market_feed_url()
-        
-        headers = {
-            "Api-Version": "3.0",
-            "Authorization": f"Bearer {self.access_token}"
-        }
-        
+
+        self.symbols = self.config.get("symbols", [
+            "NSE_INDEX|Nifty Bank",
+            "NSE_INDEX|Nifty 50",
+        ])
+
+        self.streamer = None
+        self._initialized = False
+
+    # ----------------------------------------------------------------------
+    # Callback: Handle incoming market data
+    # ----------------------------------------------------------------------
+    def on_message(self, message):
+        """Called when market data is received"""
         try:
-            from websockets.asyncio.client import connect as ws_connect
-            import websockets
-            print(f"DEBUG: websockets version: {websockets.__version__}")
-            print(f"DEBUG: Connecting to {self.ws_url}")
+            print("\n📈 Tick Data:")
             
-            self.ws = await ws_connect(
-                self.ws_url,
-                additional_headers=headers
-            )
+            # The SDK automatically decodes protobuf messages
+            # message is already a Python dict
+            feeds = message.get("feeds", {})
             
-            print(f"✅ WebSocket connected successfully for user {self.user_id}")
+            if not feeds:
+                print("⚠ No feed data in packet (heartbeat or header)")
+                return
+            
+            for instrument, feed in feeds.items():
+                # print(f"\n📊 {instrument}:")
+                # print(json.dumps(feed, indent=2))
+                
         except Exception as e:
-            print(f"❌ Connection error: {e}")
-            raise e
-        
-        # ✅ Wait a moment for connection to stabilize
-        await asyncio.sleep(0.5)
+            print(f"❌ Error processing message: {e}")
+
+    def on_open(self):
+        """Called when WebSocket connection opens"""
+        print("✅ WebSocket Connected")
         
         # Subscribe to instruments
-        symbols = self.config.get("symbols", ["NSE_INDEX|Nifty Bank", "NSE_INDEX|Nifty 50"])
-        print(f"📊 Subscribing to: {symbols}")
-        
-        subscription_data = {
-            "guid": "someguid",  # ✅ Use same guid format as Node.js
-            "method": "sub",
-            "data": {
-                "mode": "full",
-                "instrumentKeys": symbols
-            }
-        }
-        
-        await self.ws.send(json.dumps(subscription_data))
-        print(f"✅ Subscription sent for instruments: {symbols}")
-        
-    async def listen(self):
-        """Listen for WebSocket messages"""
         try:
-            from app.services.protobuf_decoder import decode_message
+            self.streamer.subscribe(
+                self.symbols,
+                "full"  # Options: "ltpc", "full"
+            )
+            print(f"📨 Subscribed to: {self.symbols}")
+        except Exception as e:
+            print(f"❌ Subscription error: {e}")
+
+    def on_error(self, error):
+        """Called when an error occurs"""
+        print(f"❌ WebSocket error: {error}")
+
+    def on_close(self):
+        """Called when WebSocket connection closes"""
+        print("🔌 WebSocket closed")
+
+    # ----------------------------------------------------------------------
+    # Initialize streamer (replaces load_proto + get_market_feed_url)
+    # ----------------------------------------------------------------------
+    def _initialize_streamer(self):
+        """Initialize the market data streamer"""
+        if not self._initialized:
+            print("🔌 Initializing Upstox WebSocket…")
             
-            message_count = 0
-            async for message in self.ws:
-                try:
-                    message_count += 1
-                    
-                    # Upstox sends protobuf encoded binary data
-                    if isinstance(message, bytes):
-                        print(f"\n📦 Received binary message #{message_count} ({len(message)} bytes)")
-                        
-                        # Decode protobuf message
-                        decoded_data = decode_message(message)
-                        
-                        if decoded_data:
-                            print(f"✅ Decoded data: {json.dumps(decoded_data, indent=2)}")
-                            
-                            # ✅ Check message type
-                            msg_type = decoded_data.get('type')
-                            
-                            if msg_type == 1:
-                                # Type 1 = Full feed data
-                                print("📈 MARKET DATA FEED RECEIVED")
-                                if 'feeds' in decoded_data:
-                                    print(f"📊 Feed contains {len(decoded_data['feeds'])} instruments")
-                                    await analyze_trend(decoded_data, self.user_id, self.config)
-                                else:
-                                    print("⚠️ No 'feeds' field in decoded data")
-                                    
-                            elif msg_type == 2:
-                                # Type 2 = Heartbeat/ping
-                                print("💓 Heartbeat message")
-                                
-                            else:
-                                print(f"ℹ️ Message type: {msg_type}")
-                                # Still analyze other message types
-                                await analyze_trend(decoded_data, self.user_id, self.config)
-                        else:
-                            print(f"❌ Failed to decode message")
-                            # Print first 100 bytes for debugging
-                            print(f"Raw bytes (first 100): {message[:100]}")
-                    else:
-                        # Handle JSON messages (if any)
-                        print(f"📄 Received text message: {message}")
-                        
-                except Exception as e:
-                    print(f"❌ Error processing message #{message_count}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"🔌 WebSocket connection closed: {e}")
-        except Exception as e:
-            print(f"❌ WebSocket error: {e}")
-            import traceback
-            traceback.print_exc()
-    
+            # Create configuration and set access token
+            configuration = upstox_client.Configuration()
+            configuration.access_token = self.access_token
+            
+            # Create API client
+            api_client = upstox_client.ApiClient(configuration)
+            
+            # Initialize streamer with API client
+            self.streamer = upstox_client.MarketDataStreamerV3(api_client)
+            
+            # Register event handlers using .on() method
+            self.streamer.on("open", self.on_open)
+            self.streamer.on("message", self.on_message)
+            self.streamer.on("error", self.on_error)
+            self.streamer.on("close", self.on_close)
+            
+            self._initialized = True
+            print("✅ WebSocket Initialized")
+
+    # ----------------------------------------------------------------------
+    # Start WebSocket Connection (keeps same interface as before)
+    # ----------------------------------------------------------------------
     async def start(self):
-        """Start WebSocket connection and listening"""
+        """Initialize and start the market data streamer"""
         try:
-            await self.connect()
-            await self.listen()
+            # Initialize streamer
+            self._initialize_streamer()
+            
+            # Connect to WebSocket
+            self.streamer.connect()
+            
+            # Keep the connection alive
+            while True:
+                await asyncio.sleep(1)
+                
+        except ApiException as e:
+            print(f"❌ API Exception: {e}")
         except Exception as e:
-            print(f"❌ Failed to start WebSocket: {e}")
-            raise
+            print(f"❌ Connection error: {e}")
+
+    # ----------------------------------------------------------------------
+    # Stop WebSocket Connection
+    # ----------------------------------------------------------------------
+    def stop(self):
+        """Gracefully close the WebSocket connection"""
+        if self.streamer:
+            self.streamer.disconnect()
+            print("🔌 WebSocket disconnected")
+
+    # ----------------------------------------------------------------------
+    # Change subscription (add/remove instruments)
+    # ----------------------------------------------------------------------
+    def subscribe(self, instruments: list, mode: str = "full"):
+        """
+        Subscribe to additional instruments
+        mode: "ltpc" or "full"
+        """
+        if self.streamer:
+            self.streamer.subscribe(instruments, mode)
+            print(f"📨 Subscribed to: {instruments}")
+
+    def unsubscribe(self, instruments: list):
+        """Unsubscribe from instruments"""
+        if self.streamer:
+            self.streamer.unsubscribe(instruments)
+            print(f"📭 Unsubscribed from: {instruments}")
 
 
-async def initialize_websocket(access_token: str, user_id: str = "default", config: dict = None):
-    """Initialize and start WebSocket connection"""
-    ws_client = UpstoxWebSocket(access_token, user_id, config)
-    await ws_client.start()
+# ----------------------------------------------------------------------
+# 🔥 EXAMPLE USAGE - Maintains backward compatibility
+# ----------------------------------------------------------------------
+# async def main():
+#     # Your existing initialization pattern works unchanged:
+#     access_token = ""
+#     user_id = "user123"
+#     config = {
+#         "symbols": [
+#             "NSE_INDEX|Nifty Bank",
+#             "NSE_INDEX|Nifty 50",
+#             "NSE_EQ|INE669E01016",
+#         ]
+#     }
+    
+    
+#     ws_client = UpstoxWebSocket(access_token, user_id, config)
+    
+#     try:
+#         # Start streaming (same as before)
+#         await ws_client.start()
+#     except KeyboardInterrupt:
+#         print("\n⏹ Stopping...")
+#         ws_client.stop()
+
+
+# # Run the WebSocket client
+# if __name__ == "__main__":
+#     asyncio.run(main())

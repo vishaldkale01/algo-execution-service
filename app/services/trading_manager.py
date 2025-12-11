@@ -76,7 +76,7 @@ class TradingManager:
     async def start_user_trading(self, user_id: str, data: dict):
         access_token = data.get("access_token")
         config = data.get("strategy_config")
-        
+        print("config:", config)    
         if not access_token:
             print(f"❌ Missing access token for {user_id}")
             return
@@ -86,6 +86,7 @@ class TradingManager:
             return
 
         trader = UserTrader(user_id, access_token, config)
+        print("trader:", trader)
         self.active_traders[user_id] = trader
         await trader.start()
 
