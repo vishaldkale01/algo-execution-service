@@ -8,3 +8,5 @@ upstox-python-sdk
 redis
 pandas
 pandas_ta
+fastapi
+uvicorn

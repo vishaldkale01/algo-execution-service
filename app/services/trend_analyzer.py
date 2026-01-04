@@ -1,66 +1,104 @@
-from typing import List, Dict, Any
-from datetime import datetime, time
+from typing import List, Dict, Any, Tuple
+from datetime import datetime, time, timedelta
 import pandas as pd
 import pandas_ta as ta
 from app.models.trade import VirtualTrade, TradeType, TradeStatus
 from app.utils.patterns import identify_patterns, is_strong_candle
 from app.database import get_database
 
+# -----------------------------------------------------------------------------
+# CONSTANTS & CONFIGURATION
+# -----------------------------------------------------------------------------
+
+class Constants:
+    # Risk Management
+    ATR_PERIOD = 14
+    ATR_MIN_THRESHOLD = 5.0 # Minimum volatility to trade (Index Points)
+    SL_MULTIPLIER = 1.0     # 1x ATR
+    TARGET_MULTIPLIER = 1.5 # 1.5x ATR
+    
+    # Signal Scoring
+    MIN_SCORE = 4
+    
+    # Time Windows
+    TIME_MORNING_START = time(9, 25)
+    TIME_MORNING_END = time(11, 30)
+    TIME_AFTERNOON_START = time(13, 15)
+    TIME_AFTERNOON_END = time(14, 45)
+    
+    # Option Constraints
+    MIN_PREMIUM = 80.0
+    MAX_SPREAD_PCT = 2.0
+    RSI_CALL_MAX = 70.0
+    RSI_PUT_MIN = 30.0
+
 # Cache for recent calculations
-calculation_cache = {}
-CACHE_EXPIRY = 1 * 60 * 1000  # 1 minute in milliseconds
-
-# Signal history cache
-previous_signals_cache = {}
-
-# In-memory candle storage
-# Structure: candle_store[symbol] = [{'timestamp': datetime, 'open': float, ...}, ...]
-candle_store = {}
-
-# VWAP Storage
-# Structure: vwap_store[symbol] = {'cum_pv': float, 'cum_vol': float, 'last_reset': date}
-vwap_store = {}
-
-# Market Context (PCR, etc.)
-# Structure: market_context[symbol] = {'pcr': float, 'updated_at': timestamp}
-market_context = {}
+market_context = {}  # {symbol: {'pcr': float, 'updated_at': timestamp}}
+trade_lock_store = {} # {symbol: {locked: bool, ...}}
+orb_store = {}        # {symbol: {high, low, set}}
+vwap_store = {}       # {symbol: {cum_pv, cum_vol}}
+candle_store = {}     # {symbol: [candles]}
 
 # -----------------------------------------------------------------------------
-# NEW: Global State for Strategy (Locks, ORB)
+# HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 
-# Trade Lock Store
-# Structure: trade_lock_store[symbol] = {
-#     "locked": bool, "entry_price": float, "signal_type": str, "lock_time": datetime, "counter": int
-# }
-trade_lock_store = {}
+def get_time_action(current_time: time) -> str:
+    """Check if current time is within valid trading windows."""
+    if Constants.TIME_MORNING_START <= current_time <= Constants.TIME_MORNING_END:
+        return "ALLOW"
+    if Constants.TIME_AFTERNOON_START <= current_time <= Constants.TIME_AFTERNOON_END:
+        return "ALLOW"
+    # 09:15-09:25 is implicit Reject
+    # 11:30-13:15 is Lunch/Chop -> Reject
+    # 14:45+ is Square-off -> Reject
+    return "REJECT"
 
-# ORB Store (Opening Range Breakout - First 15 mins)
-# Structure: orb_store[symbol] = { "high": float, "low": float, "set": bool, "date": date }
-orb_store = {}
-
-# Scalping configuration
-SCALPING_CONFIG = {
-    "targetPercent": 0.3, # Scalp target
-    "stopLossPercent": 0.2, # Scalp SL
-    "minConfidence": 80,  # High confidence for scalp
-    "minCandles": {
-        "oneMin": 20, # Need history for EMA21
-    },
-    "tradeLockCooldown": 5, # Candles to wait after a trade signal
-    "orbStartTime": time(9, 15),
-    "orbEndTime": time(9, 30)
-}
-
-def update_market_context(symbol: str, pcr: float):
-    """Update global market context (e.g., PCR)"""
-    market_context[symbol] = {
-        'pcr': pcr,
-        'updated_at': datetime.now()
+def resample_to_5min(candles: List[Dict]) -> pd.DataFrame:
+    """Resample 1-min candles to 5-min dataframe for Trend Analysis."""
+    if not candles:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(candles)
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
+    
+    ohlc_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
     }
+    
+    # Resample 5T (5min)
+    df_5m = df.resample('5min').apply(ohlc_dict).dropna()
+    return df_5m
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators on 1-min Data."""
+    # EMA
+    df['ema9'] = df.ta.ema(length=9)
+    df['ema21'] = df.ta.ema(length=21)
+    
+    # RSI (14)
+    df['rsi'] = df.ta.rsi(length=14)
+    
+    # ADX (14)
+    adx_df = df.ta.adx(length=14)
+    if adx_df is not None and not adx_df.empty:
+        # pandas_ta returns ADX_14, DMP_14, DMN_14
+        df['adx'] = adx_df['ADX_14']
+    else:
+        df['adx'] = 0
+        
+    # ATR (14)
+    df['atr'] = df.ta.atr(length=Constants.ATR_PERIOD)
+    
+    return df
 
 def calculate_vwap(symbol: str, candle: Dict) -> float:
-    """Calculate Intraday VWAP"""
+    """Calculate Intraday VWAP (Cumulative)."""
     current_date = candle['timestamp'].date()
     
     if symbol not in vwap_store:
@@ -77,287 +115,229 @@ def calculate_vwap(symbol: str, candle: Dict) -> float:
     vwap_store[symbol]['cum_vol'] += volume
     
     if vwap_store[symbol]['cum_vol'] == 0:
-        return typical_price # Fallback
+        return typical_price
         
     return vwap_store[symbol]['cum_pv'] / vwap_store[symbol]['cum_vol']
 
-def update_orb_levels(symbol: str, candles: List[Dict]):
-    """Update Open Range Breakout (ORB) levels for the day"""
-    if not candles: return
-
-    current_date = candles[-1]['timestamp'].date()
+def calculate_signal_score(
+    signals: Dict, 
+    trend_aligned: bool, 
+    adx: float, 
+    rsi: float, 
+    volume_expansion: bool,
+    bias: str
+) -> int:
+    """Score the trade setup based on confluence."""
+    score = 0
     
-    # Initialize or Reset for new day
-    if symbol not in orb_store or orb_store[symbol].get('date') != current_date:
-        orb_store[symbol] = { "high": 0, "low": float('inf'), "set": False, "date": current_date }
-    
-    orb = orb_store[symbol]
-    
-    if orb['set']:
-        return # Already set for the day
-
-    # Filter candles between 9:15 and 9:30
-    orb_candles = [
-        c for c in candles 
-        if c['timestamp'].date() == current_date and 
-           SCALPING_CONFIG['orbStartTime'] <= c['timestamp'].time() < SCALPING_CONFIG['orbEndTime']
-    ]
-    
-    if orb_candles:
-        highs = [c['high'] for c in orb_candles]
-        lows = [c['low'] for c in orb_candles]
-        orb['high'] = max(highs)
-        orb['low'] = min(lows)
+    # 1. Trend Alignment (+2)
+    if trend_aligned:
+        score += 2
         
-        # If time is past 9:30, mark as SET
-        if candles[-1]['timestamp'].time() >= SCALPING_CONFIG['orbEndTime']:
-            orb['set'] = True
-            # print(f"ORB SET for {symbol}: {orb['high']} - {orb['low']}")
+    # 2. Regime (ADX) (+2)
+    if adx > 25:
+        score += 2
+    elif adx > 20: # Weak but valid
+        score += 1
+        
+    # 3. RSI Zone (+1)
+    # Ideal Bull: 50-70, Ideal Bear: 30-50
+    if bias == "BULL" and 50 <= rsi <= 70:
+        score += 1
+    elif bias == "BEAR" and 30 <= rsi <= 50:
+        score += 1
+        
+    # 4. Volume Expansion (+1)
+    if volume_expansion:
+        score += 1
+        
+    # 5. Pattern (+1)
+    if signals.get('setup', '') != "":
+        score += 1
+        
+    return score
 
-def check_trade_lock(symbol: str, current_price: float, candles: List[Dict]) -> bool:
-    """
-    Check if trading is locked for this symbol.
-    Unlock conditions:
-    1. Cooldown timer expired (5 candles).
-    2. Price returns to range (simple mean reversion check vs Entry).
-    """
-    if symbol not in trade_lock_store:
-        return False
-        
-    lock = trade_lock_store[symbol]
-    if not lock['locked']:
-        return False
-        
-    # Condition 1: Counter / Time
-    # In a real async stream, we count invocations or time. Here we rely on candle updates.
-    # We'll just check time difference if simple, or assume this is called per candle.
-    # Let's use time difference since 'lock_time'. 
-    # Assuming 1-min candles, 5 mins cooldown.
-    time_diff = datetime.now() - lock['lock_time']
-    if time_diff.total_seconds() > (SCALPING_CONFIG['tradeLockCooldown'] * 60):
-        lock['locked'] = False
-        return False
-        
-    # Condition 2: Deep Reversal (Stop Loss hit effectively or Invalidated)
-    # This is handled by Trade Manager usually. 
-    # Here we just implement strict time cooldown to prevent over-signaling.
-    
-    return True
+# -----------------------------------------------------------------------------
+# CORE LOGIC
+# -----------------------------------------------------------------------------
 
-def set_trade_lock(symbol: str, signal: str, price: float):
-    """Lock trading after substantial signal"""
-    trade_lock_store[symbol] = {
-        "locked": True,
-        "entry_price": price,
-        "signal_type": signal,
-        "lock_time": datetime.now(),
-        "counter": 0
-    }
+def update_market_context(symbol: str, pcr: float):
+    market_context[symbol] = {'pcr': pcr, 'updated_at': datetime.now()}
 
 def analyze_scalping_signals(symbol: str, candles: List[Dict], current_price: float) -> Dict:
     """
-    Analyze scalping signals using:
-    1. Market Structure (Trend)
-    2. Patterns (Hammer, Engulfing, etc.)
-    3. Breakouts (ORB)
-    4. Filters (Volume, VWAP, Trade Lock)
+    Revised Professional Scalping Logic.
+    Flow: Time -> Data -> Timeframe Context -> Filters -> Trigger -> Score -> Output
     """
-    if len(candles) < 22: 
+    
+    # 0. Data Validity
+    if len(candles) < 150: 
         return {}
         
-    # 1. Update ORB
-    update_orb_levels(symbol, candles)
-    
-    # 2. Check Lock
-    if check_trade_lock(symbol, current_price, candles):
-        return {"signal": "LOCKED", "reason": "Cooldown Active"}
-
-    # Convert to DataFrame for Indicators
-    df = pd.DataFrame(candles)
-    cols = ['open', 'high', 'low', 'close', 'volume']
-    for col in cols:
-        df[col] = pd.to_numeric(df[col])
-        
-    # Calculate Indicators
-    df['ema9'] = df.ta.ema(length=9)
-    df['ema21'] = df.ta.ema(length=21)
-    
-    vwap_value = calculate_vwap(symbol, candles[-1])
-    
     last_candle = candles[-1]
-    prev_candle = candles[-2]
+    timestamp = last_candle['timestamp']
     
-    ema9_val = df['ema9'].iloc[-1]
-    ema21_val = df['ema21'].iloc[-1]
+    # Check Stale Data
+    lag = (datetime.now() - timestamp).total_seconds()
+    if lag > 120: # 2 minutes lag max
+        # print(f"Ignoring Stale Data: Lag {lag}s")
+        return {}
     
-    # Pattern Recognition
-    patterns = identify_patterns(candles)
+    # 1. Time Filter (Hard Rule)
+    time_action = get_time_action(timestamp.time())
+    if time_action == "REJECT":
+        # We can silently return or log "Market Closed/Chop"
+        return {} # No signal in invalid time
+
+    # 2. Prepare 1-min Data & Indicators
+    df_1min = pd.DataFrame(candles)
+    # Convert cols
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df_1min[col] = pd.to_numeric(df_1min[col])
+        
+    df_1min = calculate_indicators(df_1min)
     
-    # Market Context
-    pcr = market_context.get(symbol, {}).get('pcr', 1.0)
+    # Current Values
+    ema9 = df_1min['ema9'].iloc[-1]
+    ema21 = df_1min['ema21'].iloc[-1]
+    rsi = df_1min['rsi'].iloc[-1]
+    adx = df_1min['adx'].iloc[-1]
+    atr = df_1min['atr'].iloc[-1]
+    volume = df_1min['volume'].iloc[-1]
+    vwap = calculate_vwap(symbol, last_candle)
     
-    signal = "NEUTRAL"
-    confidence = 0
-    setup_type = ""
+    # 3. Prepare 5-min Context (MTF)
+    df_5m = resample_to_5min(candles)
+    if len(df_5m) < 20: 
+        return {} # Not enough 5m history
+        
+    df_5m['ema20'] = df_5m.ta.ema(length=20)
+    
+    # 5-min Trend Bias
+    trend_bias = "NEUTRAL"
+    c5_close = df_5m['close'].iloc[-1]
+    c5_ema20 = df_5m['ema20'].iloc[-1]
+    
+    if c5_close > c5_ema20:
+        trend_bias = "BULL"
+    elif c5_close < c5_ema20:
+        trend_bias = "BEAR"
+        
+    # 4. Regime Filter (ADX)
+    if adx < 20:
+        return {"signal": "NEUTRAL", "reason": "Low ADX (Chop)"}
+        
+    # 5. Pattern Detection (Trigger)
+    patterns = identify_patterns(candles) # Uses last 2-20 candles
+    
+    signal = 'NEUTRAL'
+    setup_type = ''
+    
+    # --- Logic 1: Trend Pullback / Continuation ---
+    if trend_bias == "BULL":
+        # Look for Bullish Setup
+        if patterns['is_bullish_engulfing'] or patterns['is_hammer']:
+            if current_price > vwap: # VWAP Confirmation
+                signal = "BUY_CALL"
+                setup_type = "TREND_PULLBACK"
+                
+    elif trend_bias == "BEAR":
+        # Look for Bearish Setup
+        if patterns['is_bearish_engulfing'] or patterns['is_shooting_star']:
+            if current_price < vwap:
+                signal = "BUY_PUT"
+                setup_type = "TREND_PULLBACK"
+                
+    # --- Logic 2: Momentum Breakout (ORB / Strong Candle) ---
+    is_strong = is_strong_candle(last_candle)
+    if is_strong == "STRONG_BULL" and trend_bias == "BULL":
+        if current_price > vwap and ema9 > ema21:
+            signal = "BUY_CALL"
+            setup_type = "MOMENTUM_BREAKOUT"
+            
+    elif is_strong == "STRONG_BEAR" and trend_bias == "BEAR":
+        if current_price < vwap and ema9 < ema21:
+            signal = "BUY_PUT"
+            setup_type = "MOMENTUM_BREAKOUT"
+
+    # If No Trigger, Return
+    if signal == "NEUTRAL":
+        return {}
+        
+    # 6. Signal Scoring
+    trend_aligned = (signal == "BUY_CALL" and trend_bias == "BULL") or \
+                    (signal == "BUY_PUT" and trend_bias == "BEAR")
+                    
+    score = calculate_signal_score(
+        {"setup": setup_type},
+        trend_aligned,
+        adx,
+        rsi,
+        patterns['has_volume_support'],
+        trend_bias
+    )
+    
+    # 7. Final Threshold Check
+    if score < Constants.MIN_SCORE:
+        # Log weak signal?
+        return {"signal": "IGNORED", "reason": f"Low Score: {score}"}
+        
+    # 8. Risk Calculation (ATR)
+    # Ensure ATR is valid
+    current_atr = atr if not pd.isna(atr) else (current_price * 0.002) # Fallback 0.2%
+    if current_atr < Constants.ATR_MIN_THRESHOLD:
+         return {"signal": "IGNORED", "reason": "Low Volatility (ATR)"}
+         
+    stop_loss_dist = current_atr * Constants.SL_MULTIPLIER
+    target_dist = current_atr * Constants.TARGET_MULTIPLIER
+    
     stop_loss = 0.0
-
-    # ------------------------------------------------------------------
-    # DECISION TREE IMPLEMENTATION
-    # ------------------------------------------------------------------
+    target = 0.0
     
-    # Valid Locations
-    near_vwap = abs(current_price - vwap_value) <= (0.001 * current_price)
-    near_ema = abs(current_price - ema9_val) <= (0.001 * current_price)
-    location_valid = near_vwap or near_ema
+    if signal == "BUY_CALL":
+        stop_loss = current_price - stop_loss_dist
+        target = current_price + target_dist
+    elif signal == "BUY_PUT":
+        stop_loss = current_price + stop_loss_dist
+        target = current_price - target_dist
 
-    # PRIORITY 1: ORB Breakout (High Confidence)
-    orb = orb_store.get(symbol)
-    if orb and orb['set']:
-        # Bullish ORB
-        if current_price > orb['high'] and patterns['has_volume_support']:
-            # Ensure we haven't ranged too far? Breakout just happened?
-            # Check if previous Close was BELOW ORB High (Fresh Breakout)
-            if prev_candle['close'] <= orb['high']:
-                signal = "BUY_CALL"
-                confidence = 95
-                setup_type = "ORB_BREAKOUT"
-                stop_loss = orb['high'] * (1 - 0.001) # Tight SL below breakout
-
-        # Bearish ORB
-        elif current_price < orb['low'] and patterns['has_volume_support']:
-            if prev_candle['close'] >= orb['low']:
-                signal = "BUY_PUT"
-                confidence = 95
-                setup_type = "ORB_BREAKOUT"
-                stop_loss = orb['low'] * (1 + 0.001)
-
-    # PRIORITY 2: Range Breakout / Generic Breakout (Skipped for now, covered by ORB/Momentum)
-    
-    # PRIORITY 3: Inside Bar Breakout
-    if signal == "NEUTRAL" and patterns['is_inside_bar']: 
-        # Inside Bar itself is neutral, we need the NEXT candle to break it
-        # This checks if PREVIOUS was inside bar ?? 
-        # No, 'is_inside_bar' from helper checks if CURRENT is inside previous.
-        # So we can't trade ON the inside bar. We trade the BREAK of it.
-        # Logic: If Previous Checks was Inside Bar... (Need state or lookback)
-        # Let's check lag:
-        is_prev_inside = identify_patterns(candles[:-1]).get('is_inside_bar', False)
-        if is_prev_inside:
-            prev_high = prev_candle['high']
-            prev_low = prev_candle['low']
-            if current_price > prev_high:
-                signal = "BUY_CALL"
-                confidence = 85
-                setup_type = "INSIDE_BAR_BREAK"
-            elif current_price < prev_low:
-                signal = "BUY_PUT"
-                confidence = 85
-                setup_type = "INSIDE_BAR_BREAK"
-
-    # PRIORITY 4: Engulfing (Reversal/Continuation)
-    if signal == "NEUTRAL":
-        if patterns['is_bullish_engulfing'] and (location_valid or ema9_val > ema21_val):
-            signal = "BUY_CALL"
-            confidence = 80
-            setup_type = "BULL_ENGULFING"
-        elif patterns['is_bearish_engulfing'] and (location_valid or ema9_val < ema21_val):
-            signal = "BUY_PUT"
-            confidence = 80
-            setup_type = "BEAR_ENGULFING"
-
-    # PRIORITY 5: Hammer / Shooting Star (Reversal)
-    if signal == "NEUTRAL" and location_valid:
-        if patterns['is_hammer']:
-            # Confirm with trend or context
-            if ema9_val > ema21_val or pcr < 1: 
-                signal = "BUY_CALL"
-                confidence = 75
-                setup_type = "HAMMER_REVERSAL"
-        elif patterns['is_shooting_star']:
-             if ema9_val < ema21_val or pcr > 1:
-                signal = "BUY_PUT"
-                confidence = 75
-                setup_type = "SHOOTING_STAR"
-
-    # PRIORITY 6: Momentum (Fallback - Existing Logic)
-    if signal == "NEUTRAL":
-        price_action = is_strong_candle(last_candle) # Replaces old analyze_price_action
-        if (current_price > vwap_value and ema9_val > ema21_val and 
-            price_action == "STRONG_BULL" and pcr < 1.2): # Relaxed PCR slightly
-            signal = "BUY_CALL"
-            confidence = 70
-            setup_type = "MOMENTUM_TREND"
-        elif (current_price < vwap_value and ema9_val < ema21_val and 
-              price_action == "STRONG_BEAR" and pcr > 0.8):
-            signal = "BUY_PUT"
-            confidence = 70
-            setup_type = "MOMENTUM_TREND"
-
-    # Lock Signal
-    if signal in ["BUY_CALL", "BUY_PUT"]:
-        set_trade_lock(symbol, signal, current_price)
-
+    # 9. Return Actionable Trade Signal
     return {
         "signal": signal,
-        "confidence": confidence,
         "setup": setup_type,
-        "vwap": vwap_value,
-        "ema9": ema9_val,
-        "ema21": ema21_val,
-        "pcr": pcr,
-        "stop_loss": stop_loss
+        "confidence": score * 10, # 0-100 scale approximation
+        "score": score,
+        "entry_price": current_price,
+        "stop_loss": stop_loss,
+        "target": target,
+        "vwap": vwap,
+        "ema9": ema9,
+        "ema21": ema21,
+        "adx": adx,
+        "rsi": rsi,
+        "atr": current_atr,
+        "timestamp": timestamp
     }
 
-async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
+async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None, on_signal=None):
     """Main trend analysis function triggered by WebSocket"""
     
     # 1. Parse Data
-    # Upstox WS "full" mode structure:
-    # data['feeds'][instrument_key] = { 'ff': { 'marketOHLC': { ... }, 'ltpc': { ... } } }
-    
     feeds = data.get("feeds", {})
-    if not feeds:
-        return
+    if not feeds: return
 
-    # User Config
-    user_config = config or {}
-    trade_mode = user_config.get("trade_mode", "VIRTUAL")
-    capital = user_config.get("capital", 100000)
-    
     for instrument_key, feed in feeds.items():
         try:
-            # We focus on the INDEX for signals (Bank Nifty)
-            # But we entered specific keys.
-            # Assuming instrument_key maps to "NSE_INDEX|Nifty Bank" or similar.
-            # Or if we are tracking options, we handle them separately.
-            
-            # Extract LTP and Candle
+            # 1. Extract Data
             ff = feed.get('ff', {})
-            
-            # LTP
             ltpc = ff.get('ltpc', {})
             ltp = ltpc.get('ltp', ltpc.get('cp', 0))
             if not ltp: continue
             
-            # Volume (Try to find it)
-            volume = 0
-            if 'marketOHLC' in ff and 'ohlc' in ff['marketOHLC']:
-                # Last candle volume
-                 ohlc_data = ff['marketOHLC']['ohlc']
-                 if ohlc_data:
-                     # Usually the last one is the current minute
-                     volume = float(ohlc_data[-1].get('volume', 0))
-
-            # Store Candle
-            # We need to build our own minute candles if we want strict control, 
-            # but Upstox sends 'marketOHLC'. Let's use that for simplicity and speed.
-            
-            if 'marketOHLC' not in ff:
-                continue
-                
+            # Extract Candles
+            if 'marketOHLC' not in ff: continue
             raw_candles = ff['marketOHLC'].get('ohlc', [])
-            # Convert to our format
-            # Filter for 1min candles (interval 'I1')
+            
             candles = []
             for c in raw_candles:
                 if c.get('interval') == 'I1':
@@ -369,58 +349,75 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
                         'close': float(c['close']),
                         'volume': float(c.get('volume', 0))
                     })
-            
             if not candles: continue
             
+            # Sort & Merge with History
             candles.sort(key=lambda x: x['timestamp'])
-            
-            # --- Merge with existing history ---
             if instrument_key not in candle_store:
                 candle_store[instrument_key] = []
             
-            existing = candle_store[instrument_key]
-            # Create dict for fast lookup
-            existing_map = {c['timestamp']: c for c in existing}
-            
+            # Simple Merge Logic (Append new ones)
+            # In prod, use sets/dicts to avoid dups efficiently
+            existing_map = {c['timestamp']: c for c in candle_store[instrument_key]}
             for c in candles:
                 existing_map[c['timestamp']] = c
             
-            # Convert back to list and sort
             merged = list(existing_map.values())
             merged.sort(key=lambda x: x['timestamp'])
             
-            # Keep last 150 for deeper analysis
-            if len(merged) > 150:
-                merged = merged[-150:]
-                
-            candle_store[instrument_key] = merged
-            candles = merged # Use full history for analysis
-            # ------------------------------------------
+            # Keep meaningful history (e.g. 200 for EMA200/Calculations)
+            if len(merged) > 300:
+                merged = merged[-300:]
             
-            # Only analyze if it's the Index (or the main signal source)
-            # If instrument_key is the Spot Index (e.g. NSE_INDEX|Nifty Bank)
-            if "INDEX" in instrument_key or True: # Force analyze for now
-                # Analyze
-                signals = analyze_scalping_signals(instrument_key, candles, ltp)
+            candle_store[instrument_key] = merged
+            
+            # 2. Analyze (Only if Index)
+            # Assumption: We only trigger Logic from Index data
+            # "NSE_INDEX" or similar tag should be checked. 
+            # For now, we assume explicit instrument_keys are passed that we care about.
+            if "INDEX" in instrument_key or True: # Force ALL for demo
                 
-                if not signals:
-                    continue
-                
-                if signals.get('signal') == "LOCKED":
-                    # print(f"LOCKED: {instrument_key} - Cooldown")
-                    continue
-                
-                print(f"[{datetime.now().time()}] {instrument_key} | {signals.get('signal')} | {signals.get('setup')} | Conf: {signals.get('confidence')}")
+                signals = analyze_scalping_signals(instrument_key, merged, ltp)
                 
                 # Execute Trade Logic
                 if signals.get('signal') in ["BUY_CALL", "BUY_PUT"] and signals.get('confidence', 0) >= SCALPING_CONFIG['minConfidence']:
                     # Trigger Trade
                     # We need to find the correct Option Symbol (ATM) from the Context
                     # For now, just print TRADING SIGNAL
-                    print(f"!!! EXECUTE {signals['signal']} !!! Setup: {signals['setup']} | Price: {ltp}")
                     
-                    # Store logic or call place_order here
-                    # ...
-
+                    if on_signal:
+                        await on_signal(signals)
+                    
+                    # TODO: Trigger Option Selection & Validation here
+                    # This would involve looking up the specific Option Contract (e.g., ATM)
+                    # and running a similar 'validate_option_metrics' check.
+                    
         except Exception as e:
             print(f"Analysis Error ({instrument_key}): {e}")
+            import traceback
+            traceback.print_exc()
+
+def validate_option_data(option_candle: Dict, signal_type: str, ltp: float, bid: float = 0, ask: float = 0) -> Tuple[bool, str]:
+    """
+    Validate Option Contract specific metrics.
+    1. Premium > 80 check
+    2. Spread < 2% check
+    3. RSI Momentum check (Avoid chasing)
+    """
+    # 1. Premium Check
+    if ltp < Constants.MIN_PREMIUM:
+        return False, f"Premium too low ({ltp} < {Constants.MIN_PREMIUM})"
+        
+    # 2. Spread Check
+    if bid > 0 and ask > 0:
+        spread = ask - bid
+        spread_pct = (spread / ltp) * 100
+        if spread_pct > Constants.MAX_SPREAD_PCT:
+            return False, f"Spread too wide ({spread_pct:.2f}%)"
+            
+    # 3. RSI Check (Need history, assuming option_candle has indicators or we calc it)
+    # If we only have single candle, we can't calc RSI. 
+    # Usually this requires looking up the option's history in candle_store.
+    # Here we assume the caller passes the RSI or we skip if not available.
+    
+    return True, "OK"

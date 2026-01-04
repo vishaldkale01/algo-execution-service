@@ -27,7 +27,10 @@ class CandleData(BaseModel):
     close: float
     volume: float
 
+import uuid
+
 class VirtualTrade(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     symbol: str
     tradeType: TradeType
     entryPrice: float
