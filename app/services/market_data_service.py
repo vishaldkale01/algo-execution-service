@@ -136,8 +136,28 @@ class MarketDataService:
                 if response.status_code == 200:
                     data = response.json()
                     # Response format: "data": { "NSE_INDEX|Nifty Bank": { "last_price": 12345.65, ... } }
-                    if 'data' in data and instrument_key in data['data']:
-                        return data['data'][instrument_key]['last_price']
-            except Exception:
-                pass
+                    
+                    if 'data' in data:
+                        feed_data = data['data']
+                        
+                        # 1. Direct lookup
+                        if instrument_key in feed_data:
+                            return feed_data[instrument_key]['last_price']
+                        
+                        # 2. Try URL encoded/decoded variations if mismatch
+                        # Sometimes keys come back slightly different (spaces vs %20)
+                        for key, details in feed_data.items():
+                            if key == instrument_key or key.replace(' ', '%20') == instrument_key.replace(' ', '%20'):
+                                print(f"⚠️ Key mismatch handled: Requested '{instrument_key}', Found '{key}'")
+                                return details['last_price']
+                                
+                        # 3. Debug if still not found
+                        print(f"❌ Market Status: Key '{instrument_key}' not found in response keys: {list(feed_data.keys())}")
+                        print(f"📄 Full Response: {data}")
+                        
+                    else:
+                        print(f"❌ Market Status: 'data' field missing in response: {data}")
+
+            except Exception as e:
+                print(f"❌ Exception fetching market status: {e}")
         return 0.0

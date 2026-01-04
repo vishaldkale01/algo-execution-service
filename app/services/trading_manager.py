@@ -30,7 +30,7 @@ class UserTrader:
                 # 1. Get Spot Price to identify ATM
                 market_status = await self.market_data_service.get_market_status(symbol_index)
                 if not market_status:
-                    print("⚠️ Could not fetch market status, retrying in 1 min...")
+                    print("⚠️ Could not fetch market status, retrying in 1 min..." , market_status)
                     await asyncio.sleep(60)
                     continue
                 

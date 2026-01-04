@@ -1,9 +1,9 @@
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, time
 import pandas as pd
 import pandas_ta as ta
 from app.models.trade import VirtualTrade, TradeType, TradeStatus
-from app.utils.patterns import identify_candlestick_patterns
+from app.utils.patterns import identify_patterns, is_strong_candle
 from app.database import get_database
 
 # Cache for recent calculations
@@ -25,6 +25,20 @@ vwap_store = {}
 # Structure: market_context[symbol] = {'pcr': float, 'updated_at': timestamp}
 market_context = {}
 
+# -----------------------------------------------------------------------------
+# NEW: Global State for Strategy (Locks, ORB)
+# -----------------------------------------------------------------------------
+
+# Trade Lock Store
+# Structure: trade_lock_store[symbol] = {
+#     "locked": bool, "entry_price": float, "signal_type": str, "lock_time": datetime, "counter": int
+# }
+trade_lock_store = {}
+
+# ORB Store (Opening Range Breakout - First 15 mins)
+# Structure: orb_store[symbol] = { "high": float, "low": float, "set": bool, "date": date }
+orb_store = {}
+
 # Scalping configuration
 SCALPING_CONFIG = {
     "targetPercent": 0.3, # Scalp target
@@ -32,7 +46,10 @@ SCALPING_CONFIG = {
     "minConfidence": 80,  # High confidence for scalp
     "minCandles": {
         "oneMin": 20, # Need history for EMA21
-    }
+    },
+    "tradeLockCooldown": 5, # Candles to wait after a trade signal
+    "orbStartTime": time(9, 15),
+    "orbEndTime": time(9, 30)
 }
 
 def update_market_context(symbol: str, pcr: float):
@@ -64,34 +81,98 @@ def calculate_vwap(symbol: str, candle: Dict) -> float:
         
     return vwap_store[symbol]['cum_pv'] / vwap_store[symbol]['cum_vol']
 
-def analyze_price_action(candles: List[Dict]) -> str:
-    """Analyze price action patterns"""
-    if len(candles) < 3:
-        return "NEUTRAL"
+def update_orb_levels(symbol: str, candles: List[Dict]):
+    """Update Open Range Breakout (ORB) levels for the day"""
+    if not candles: return
+
+    current_date = candles[-1]['timestamp'].date()
     
-    current = candles[-1]
-    body_size = abs(current['close'] - current['open'])
-    wick_size = abs(max(current['high'] - current['close'], current['open'] - current['low']))
+    # Initialize or Reset for new day
+    if symbol not in orb_store or orb_store[symbol].get('date') != current_date:
+        orb_store[symbol] = { "high": 0, "low": float('inf'), "set": False, "date": current_date }
     
-    if body_size > wick_size * 2:
-        return "STRONG_BULL" if current['close'] > current['open'] else "STRONG_BEAR"
+    orb = orb_store[symbol]
     
-    return "NEUTRAL"
+    if orb['set']:
+        return # Already set for the day
+
+    # Filter candles between 9:15 and 9:30
+    orb_candles = [
+        c for c in candles 
+        if c['timestamp'].date() == current_date and 
+           SCALPING_CONFIG['orbStartTime'] <= c['timestamp'].time() < SCALPING_CONFIG['orbEndTime']
+    ]
+    
+    if orb_candles:
+        highs = [c['high'] for c in orb_candles]
+        lows = [c['low'] for c in orb_candles]
+        orb['high'] = max(highs)
+        orb['low'] = min(lows)
+        
+        # If time is past 9:30, mark as SET
+        if candles[-1]['timestamp'].time() >= SCALPING_CONFIG['orbEndTime']:
+            orb['set'] = True
+            # print(f"ORB SET for {symbol}: {orb['high']} - {orb['low']}")
+
+def check_trade_lock(symbol: str, current_price: float, candles: List[Dict]) -> bool:
+    """
+    Check if trading is locked for this symbol.
+    Unlock conditions:
+    1. Cooldown timer expired (5 candles).
+    2. Price returns to range (simple mean reversion check vs Entry).
+    """
+    if symbol not in trade_lock_store:
+        return False
+        
+    lock = trade_lock_store[symbol]
+    if not lock['locked']:
+        return False
+        
+    # Condition 1: Counter / Time
+    # In a real async stream, we count invocations or time. Here we rely on candle updates.
+    # We'll just check time difference if simple, or assume this is called per candle.
+    # Let's use time difference since 'lock_time'. 
+    # Assuming 1-min candles, 5 mins cooldown.
+    time_diff = datetime.now() - lock['lock_time']
+    if time_diff.total_seconds() > (SCALPING_CONFIG['tradeLockCooldown'] * 60):
+        lock['locked'] = False
+        return False
+        
+    # Condition 2: Deep Reversal (Stop Loss hit effectively or Invalidated)
+    # This is handled by Trade Manager usually. 
+    # Here we just implement strict time cooldown to prevent over-signaling.
+    
+    return True
+
+def set_trade_lock(symbol: str, signal: str, price: float):
+    """Lock trading after substantial signal"""
+    trade_lock_store[symbol] = {
+        "locked": True,
+        "entry_price": price,
+        "signal_type": signal,
+        "lock_time": datetime.now(),
+        "counter": 0
+    }
 
 def analyze_scalping_signals(symbol: str, candles: List[Dict], current_price: float) -> Dict:
     """
-    Analyze scalping signals based on User Logic:
-    IF
-    - Price > VWAP
-    - EMA 9 > EMA 21
-    - Strong bullish candle
-    - PCR < 1 (Context)
-    THEN BUY CALL
+    Analyze scalping signals using:
+    1. Market Structure (Trend)
+    2. Patterns (Hammer, Engulfing, etc.)
+    3. Breakouts (ORB)
+    4. Filters (Volume, VWAP, Trade Lock)
     """
-    if len(candles) < 22: # Need at least 21 candles for EMA21
+    if len(candles) < 22: 
         return {}
         
-    # Convert to DataFrame
+    # 1. Update ORB
+    update_orb_levels(symbol, candles)
+    
+    # 2. Check Lock
+    if check_trade_lock(symbol, current_price, candles):
+        return {"signal": "LOCKED", "reason": "Cooldown Active"}
+
+    # Convert to DataFrame for Indicators
     df = pd.DataFrame(candles)
     cols = ['open', 'high', 'low', 'close', 'volume']
     for col in cols:
@@ -101,63 +182,130 @@ def analyze_scalping_signals(symbol: str, candles: List[Dict], current_price: fl
     df['ema9'] = df.ta.ema(length=9)
     df['ema21'] = df.ta.ema(length=21)
     
-    # VWAP (already computed per candle, but let's take the latest cached or recompute if needed)
-    # Ideally, we pass the series, but we have a running VWAP. 
-    # Let's trust the running VWAP for the current tick signal.
     vwap_value = calculate_vwap(symbol, candles[-1])
     
-    last = df.iloc[-1]
+    last_candle = candles[-1]
+    prev_candle = candles[-2]
     
-    ema9_val = last['ema9']
-    ema21_val = last['ema21']
+    ema9_val = df['ema9'].iloc[-1]
+    ema21_val = df['ema21'].iloc[-1]
     
-    # Price Action
-    price_action = analyze_price_action(candles)
+    # Pattern Recognition
+    patterns = identify_patterns(candles)
     
     # Market Context
-    pcr = market_context.get(symbol, {}).get('pcr', 1.0) # Default to 1 (Neutral)
+    pcr = market_context.get(symbol, {}).get('pcr', 1.0)
     
     signal = "NEUTRAL"
     confidence = 0
-    
+    setup_type = ""
+    stop_loss = 0.0
+
     # ------------------------------------------------------------------
-    # CORE STRATEGY LOGIC
+    # DECISION TREE IMPLEMENTATION
     # ------------------------------------------------------------------
     
-    # BUY CALL CONDITIONS
-    if (current_price > vwap_value and 
-        ema9_val > ema21_val and 
-        price_action == "STRONG_BULL" and
-        pcr < 1): # PCR < 1 usually means Bullish (lots of Puts sold support) or Bearish? 
-        # Standard: High PCR (>1.5) = Bearish/Overbought? No.
-        # Nifty Analysis: PCR > 1 means more Puts OI (Support), usually Bullish sentiment (Put writing).
-        # PCR < 1 means more Calls OI (Resistance), usually Bearish sentiment.
-        # USER REQUESTED: "PCR < 1 -> BUY CALL". 
-        # CAUTION: This contradicts standard "Put Writing = Bullish" logic (High PCR = Bullish).
-        # User prompt says: "IF ... PCR < 1 ... THEN BUY CALL (scalp)".
-        # Wait, usually PCR < 0.7 is Oversold (Buy msg). Maybe that's the logic?
-        # I will strictly follow USER LOGIC: "PCR < 1 -> BUY CALL".
-        
-        signal = "BUY_CALL"
-        confidence = 90
-        
-    # BUY PUT CONDITIONS (Inverse)
-    elif (current_price < vwap_value and 
-          ema9_val < ema21_val and 
-          price_action == "STRONG_BEAR" and 
-          pcr > 1): # Inverse of user logic for Put
-          
-        signal = "BUY_PUT"
-        confidence = 90
+    # Valid Locations
+    near_vwap = abs(current_price - vwap_value) <= (0.001 * current_price)
+    near_ema = abs(current_price - ema9_val) <= (0.001 * current_price)
+    location_valid = near_vwap or near_ema
+
+    # PRIORITY 1: ORB Breakout (High Confidence)
+    orb = orb_store.get(symbol)
+    if orb and orb['set']:
+        # Bullish ORB
+        if current_price > orb['high'] and patterns['has_volume_support']:
+            # Ensure we haven't ranged too far? Breakout just happened?
+            # Check if previous Close was BELOW ORB High (Fresh Breakout)
+            if prev_candle['close'] <= orb['high']:
+                signal = "BUY_CALL"
+                confidence = 95
+                setup_type = "ORB_BREAKOUT"
+                stop_loss = orb['high'] * (1 - 0.001) # Tight SL below breakout
+
+        # Bearish ORB
+        elif current_price < orb['low'] and patterns['has_volume_support']:
+            if prev_candle['close'] >= orb['low']:
+                signal = "BUY_PUT"
+                confidence = 95
+                setup_type = "ORB_BREAKOUT"
+                stop_loss = orb['low'] * (1 + 0.001)
+
+    # PRIORITY 2: Range Breakout / Generic Breakout (Skipped for now, covered by ORB/Momentum)
+    
+    # PRIORITY 3: Inside Bar Breakout
+    if signal == "NEUTRAL" and patterns['is_inside_bar']: 
+        # Inside Bar itself is neutral, we need the NEXT candle to break it
+        # This checks if PREVIOUS was inside bar ?? 
+        # No, 'is_inside_bar' from helper checks if CURRENT is inside previous.
+        # So we can't trade ON the inside bar. We trade the BREAK of it.
+        # Logic: If Previous Checks was Inside Bar... (Need state or lookback)
+        # Let's check lag:
+        is_prev_inside = identify_patterns(candles[:-1]).get('is_inside_bar', False)
+        if is_prev_inside:
+            prev_high = prev_candle['high']
+            prev_low = prev_candle['low']
+            if current_price > prev_high:
+                signal = "BUY_CALL"
+                confidence = 85
+                setup_type = "INSIDE_BAR_BREAK"
+            elif current_price < prev_low:
+                signal = "BUY_PUT"
+                confidence = 85
+                setup_type = "INSIDE_BAR_BREAK"
+
+    # PRIORITY 4: Engulfing (Reversal/Continuation)
+    if signal == "NEUTRAL":
+        if patterns['is_bullish_engulfing'] and (location_valid or ema9_val > ema21_val):
+            signal = "BUY_CALL"
+            confidence = 80
+            setup_type = "BULL_ENGULFING"
+        elif patterns['is_bearish_engulfing'] and (location_valid or ema9_val < ema21_val):
+            signal = "BUY_PUT"
+            confidence = 80
+            setup_type = "BEAR_ENGULFING"
+
+    # PRIORITY 5: Hammer / Shooting Star (Reversal)
+    if signal == "NEUTRAL" and location_valid:
+        if patterns['is_hammer']:
+            # Confirm with trend or context
+            if ema9_val > ema21_val or pcr < 1: 
+                signal = "BUY_CALL"
+                confidence = 75
+                setup_type = "HAMMER_REVERSAL"
+        elif patterns['is_shooting_star']:
+             if ema9_val < ema21_val or pcr > 1:
+                signal = "BUY_PUT"
+                confidence = 75
+                setup_type = "SHOOTING_STAR"
+
+    # PRIORITY 6: Momentum (Fallback - Existing Logic)
+    if signal == "NEUTRAL":
+        price_action = is_strong_candle(last_candle) # Replaces old analyze_price_action
+        if (current_price > vwap_value and ema9_val > ema21_val and 
+            price_action == "STRONG_BULL" and pcr < 1.2): # Relaxed PCR slightly
+            signal = "BUY_CALL"
+            confidence = 70
+            setup_type = "MOMENTUM_TREND"
+        elif (current_price < vwap_value and ema9_val < ema21_val and 
+              price_action == "STRONG_BEAR" and pcr > 0.8):
+            signal = "BUY_PUT"
+            confidence = 70
+            setup_type = "MOMENTUM_TREND"
+
+    # Lock Signal
+    if signal in ["BUY_CALL", "BUY_PUT"]:
+        set_trade_lock(symbol, signal, current_price)
 
     return {
         "signal": signal,
         "confidence": confidence,
+        "setup": setup_type,
         "vwap": vwap_value,
         "ema9": ema9_val,
         "ema21": ema21_val,
         "pcr": pcr,
-        "priceAction": price_action
+        "stop_loss": stop_loss
     }
 
 async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
@@ -226,7 +374,7 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
             
             candles.sort(key=lambda x: x['timestamp'])
             
-            # --- FIXED: Merge with existing history ---
+            # --- Merge with existing history ---
             if instrument_key not in candle_store:
                 candle_store[instrument_key] = []
             
@@ -241,9 +389,9 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
             merged = list(existing_map.values())
             merged.sort(key=lambda x: x['timestamp'])
             
-            # Keep last 100
-            if len(merged) > 100:
-                merged = merged[-100:]
+            # Keep last 150 for deeper analysis
+            if len(merged) > 150:
+                merged = merged[-150:]
                 
             candle_store[instrument_key] = merged
             candles = merged # Use full history for analysis
@@ -251,22 +399,25 @@ async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None):
             
             # Only analyze if it's the Index (or the main signal source)
             # If instrument_key is the Spot Index (e.g. NSE_INDEX|Nifty Bank)
-            if "INDEX" in instrument_key:
+            if "INDEX" in instrument_key or True: # Force analyze for now
                 # Analyze
                 signals = analyze_scalping_signals(instrument_key, candles, ltp)
                 
                 if not signals:
-                    print(f"Stats: {len(candles)} candles (Need 22 for signals)")
                     continue
                 
-                print(f"Data {instrument_key} | {signals.get('signal')} | Conf: {signals.get('confidence')} | Price: {ltp} | VWAP: {signals.get('vwap', 0):.2f}")
+                if signals.get('signal') == "LOCKED":
+                    # print(f"LOCKED: {instrument_key} - Cooldown")
+                    continue
+                
+                print(f"[{datetime.now().time()}] {instrument_key} | {signals.get('signal')} | {signals.get('setup')} | Conf: {signals.get('confidence')}")
                 
                 # Execute Trade Logic
                 if signals.get('signal') in ["BUY_CALL", "BUY_PUT"] and signals.get('confidence', 0) >= SCALPING_CONFIG['minConfidence']:
                     # Trigger Trade
                     # We need to find the correct Option Symbol (ATM) from the Context
                     # For now, just print TRADING SIGNAL
-                    print(f"EXECUTE {signals['signal']} on {instrument_key}")
+                    print(f"!!! EXECUTE {signals['signal']} !!! Setup: {signals['setup']} | Price: {ltp}")
                     
                     # Store logic or call place_order here
                     # ...
