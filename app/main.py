@@ -29,6 +29,7 @@ async def main():
     print("🎧 Waiting for commands on 'trading:commands'...")
     try:
         await redis_manager.subscribe("trading:commands", trading_manager.handle_command)
+        breakpoint()
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
     finally:

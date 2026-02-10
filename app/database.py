@@ -23,10 +23,10 @@ async def connect_to_mongo():
         
         # Test connection
         await _client.admin.command('ping')
-        print(f"✅ Connected to MongoDB: {database_name}")
+        print(f"[OK] Connected to MongoDB: {database_name}")
         
     except Exception as e:
-        print(f"❌ Failed to connect to MongoDB: {e}")
+        print(f"[ERROR] Failed to connect to MongoDB: {e}")
         raise
 
 

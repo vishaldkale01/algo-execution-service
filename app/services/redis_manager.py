@@ -12,7 +12,7 @@ class RedisManager:
     async def connect(self):
         """Connect to Redis"""
         self.redis = redis.from_url(self.redis_url, decode_responses=True)
-        print(f"✅ Connected to Redis at {self.redis_url}")
+        print(f"[OK] Connected to Redis at {self.redis_url}")
 
     async def disconnect(self):
         """Disconnect from Redis"""
@@ -33,7 +33,7 @@ class RedisManager:
         
         self.pubsub = self.redis.pubsub()
         await self.pubsub.subscribe(channel)
-        print(f"🎧 Subscribed to channel: {channel}")
+        print(f"[INFO] Subscribed to channel: {channel}")
 
         async for message in self.pubsub.listen():
             if message["type"] == "message":
@@ -41,9 +41,9 @@ class RedisManager:
                     data = json.loads(message["data"])
                     await callback(data)
                 except json.JSONDecodeError:
-                    print(f"❌ Failed to decode message: {message['data']}")
+                    print(f"[ERROR] Failed to decode message: {message['data']}")
                 except Exception as e:
-                    print(f"❌ Error processing message: {e}")
+                    print(f"[ERROR] Error processing message: {e}")
 
 # Global instance
 redis_manager = RedisManager()

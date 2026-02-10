@@ -8,9 +8,20 @@ class TradeType(str, Enum):
     PUT = "PUT"
 
 class TradeStatus(str, Enum):
-    OPEN = "OPEN"
+    # Lifecycle
+    PENDING_ENTRY = "PENDING_ENTRY"
+    SUBMITTED = "SUBMITTED"
+    OPEN = "OPEN"           # Fully filled
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    
+    # Exit States
+    EXIT_PENDING = "EXIT_PENDING"
     CLOSED = "CLOSED"
-    STOPPED = "STOPPED"
+    
+    # Failure/Cancel States
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+    ERROR = "ERROR"
 
 class Signals(BaseModel):
     ema: Optional[str] = None
@@ -47,3 +58,7 @@ class VirtualTrade(BaseModel):
 
     class Config:
         use_enum_values = True
+        populate_by_name = True
+
+    def to_mongo(self):
+        return self.model_dump(by_alias=True)

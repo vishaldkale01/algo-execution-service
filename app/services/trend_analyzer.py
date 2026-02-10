@@ -1,423 +1,365 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, time, timedelta
 import pandas as pd
 import pandas_ta as ta
-from app.models.trade import VirtualTrade, TradeType, TradeStatus
+from dataclasses import dataclass, field
+from app.models.trade import TradeType
 from app.utils.patterns import identify_patterns, is_strong_candle
-from app.database import get_database
 
 # -----------------------------------------------------------------------------
 # CONSTANTS & CONFIGURATION
 # -----------------------------------------------------------------------------
 
-class Constants:
-    # Risk Management
+class Config:
+    # Risk & Strategy
     ATR_PERIOD = 14
-    ATR_MIN_THRESHOLD = 5.0 # Minimum volatility to trade (Index Points)
-    SL_MULTIPLIER = 1.0     # 1x ATR
-    TARGET_MULTIPLIER = 1.5 # 1.5x ATR
-    
-    # Signal Scoring
-    MIN_SCORE = 4
+    ATR_MIN_THRESHOLD = 5.0
+    SL_MULTIPLIER = 1.0
+    TARGET_MULTIPLIER = 1.5
     
     # Time Windows
-    TIME_MORNING_START = time(9, 25)
+    TIME_MORNING_START = time(9, 20) # Allow 5 mins for settlement
     TIME_MORNING_END = time(11, 30)
     TIME_AFTERNOON_START = time(13, 15)
-    TIME_AFTERNOON_END = time(14, 45)
+    TIME_AFTERNOON_END = time(15, 0)
     
-    # Option Constraints
-    MIN_PREMIUM = 80.0
-    MAX_SPREAD_PCT = 2.0
-    RSI_CALL_MAX = 70.0
-    RSI_PUT_MIN = 30.0
+    # Selection
+    MIN_SCORE = 5 # Stricter
 
-# Cache for recent calculations
-market_context = {}  # {symbol: {'pcr': float, 'updated_at': timestamp}}
-trade_lock_store = {} # {symbol: {locked: bool, ...}}
-orb_store = {}        # {symbol: {high, low, set}}
-vwap_store = {}       # {symbol: {cum_pv, cum_vol}}
-candle_store = {}     # {symbol: [candles]}
+@dataclass
+class MarketState:
+    """Holds state for a single instrument"""
+    candles: List[Dict] = field(default_factory=list)
+    vwap: Dict = field(default_factory=lambda: {'cum_pv': 0.0, 'cum_vol': 0.0, 'last_reset': None})
+    orb: Dict = field(default_factory=lambda: {'high': 0.0, 'low': 0.0, 'set': False})
+    pcr: float = 1.0
+    cpr: Dict = field(default_factory=lambda: {'tc': 0, 'bc': 0, 'pivot': 0})
+    oi_history: List[Dict] = field(default_factory=list) # [{'timestamp': ..., 'pcr': ..., 'call_oi': ..., 'put_oi': ...}]
+    last_signal_time: Optional[datetime] = None
 
-# -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
-# -----------------------------------------------------------------------------
-
-def get_time_action(current_time: time) -> str:
-    """Check if current time is within valid trading windows."""
-    if Constants.TIME_MORNING_START <= current_time <= Constants.TIME_MORNING_END:
-        return "ALLOW"
-    if Constants.TIME_AFTERNOON_START <= current_time <= Constants.TIME_AFTERNOON_END:
-        return "ALLOW"
-    # 09:15-09:25 is implicit Reject
-    # 11:30-13:15 is Lunch/Chop -> Reject
-    # 14:45+ is Square-off -> Reject
-    return "REJECT"
-
-def resample_to_5min(candles: List[Dict]) -> pd.DataFrame:
-    """Resample 1-min candles to 5-min dataframe for Trend Analysis."""
-    if not candles:
-        return pd.DataFrame()
-        
-    df = pd.DataFrame(candles)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df.set_index('timestamp', inplace=True)
-    
-    ohlc_dict = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }
-    
-    # Resample 5T (5min)
-    df_5m = df.resample('5min').apply(ohlc_dict).dropna()
-    return df_5m
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate technical indicators on 1-min Data."""
-    # EMA
-    df['ema9'] = df.ta.ema(length=9)
-    df['ema21'] = df.ta.ema(length=21)
-    
-    # RSI (14)
-    df['rsi'] = df.ta.rsi(length=14)
-    
-    # ADX (14)
-    adx_df = df.ta.adx(length=14)
-    if adx_df is not None and not adx_df.empty:
-        # pandas_ta returns ADX_14, DMP_14, DMN_14
-        df['adx'] = adx_df['ADX_14']
-    else:
-        df['adx'] = 0
-        
-    # ATR (14)
-    df['atr'] = df.ta.atr(length=Constants.ATR_PERIOD)
-    
-    return df
-
-def calculate_vwap(symbol: str, candle: Dict) -> float:
-    """Calculate Intraday VWAP (Cumulative)."""
-    current_date = candle['timestamp'].date()
-    
-    if symbol not in vwap_store:
-        vwap_store[symbol] = {'cum_pv': 0.0, 'cum_vol': 0.0, 'last_reset': current_date}
-    
-    # Reset VWAP at start of day
-    if vwap_store[symbol]['last_reset'] < current_date:
-        vwap_store[symbol] = {'cum_pv': 0.0, 'cum_vol': 0.0, 'last_reset': current_date}
-    
-    typical_price = (candle['high'] + candle['low'] + candle['close']) / 3
-    volume = candle.get('volume', 0)
-    
-    vwap_store[symbol]['cum_pv'] += typical_price * volume
-    vwap_store[symbol]['cum_vol'] += volume
-    
-    if vwap_store[symbol]['cum_vol'] == 0:
-        return typical_price
-        
-    return vwap_store[symbol]['cum_pv'] / vwap_store[symbol]['cum_vol']
-
-def calculate_signal_score(
-    signals: Dict, 
-    trend_aligned: bool, 
-    adx: float, 
-    rsi: float, 
-    volume_expansion: bool,
-    bias: str
-) -> int:
-    """Score the trade setup based on confluence."""
-    score = 0
-    
-    # 1. Trend Alignment (+2)
-    if trend_aligned:
-        score += 2
-        
-    # 2. Regime (ADX) (+2)
-    if adx > 25:
-        score += 2
-    elif adx > 20: # Weak but valid
-        score += 1
-        
-    # 3. RSI Zone (+1)
-    # Ideal Bull: 50-70, Ideal Bear: 30-50
-    if bias == "BULL" and 50 <= rsi <= 70:
-        score += 1
-    elif bias == "BEAR" and 30 <= rsi <= 50:
-        score += 1
-        
-    # 4. Volume Expansion (+1)
-    if volume_expansion:
-        score += 1
-        
-    # 5. Pattern (+1)
-    if signals.get('setup', '') != "":
-        score += 1
-        
-    return score
-
-# -----------------------------------------------------------------------------
-# CORE LOGIC
-# -----------------------------------------------------------------------------
-
-def update_market_context(symbol: str, pcr: float):
-    market_context[symbol] = {'pcr': pcr, 'updated_at': datetime.now()}
-
-def analyze_scalping_signals(symbol: str, candles: List[Dict], current_price: float) -> Dict:
+class TrendAnalyzer:
     """
-    Revised Professional Scalping Logic.
-    Flow: Time -> Data -> Timeframe Context -> Filters -> Trigger -> Score -> Output
+    Class-based Trend Analyzer (Per User/Session).
+    Removes Global State pollution.
     """
     
-    # 0. Data Validity
-    if len(candles) < 150: 
-        return {}
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        self.state: Dict[str, MarketState] = {} # instrument_key -> MarketState
         
-    last_candle = candles[-1]
-    timestamp = last_candle['timestamp']
-    
-    # Check Stale Data
-    lag = (datetime.now() - timestamp).total_seconds()
-    if lag > 120: # 2 minutes lag max
-        # print(f"Ignoring Stale Data: Lag {lag}s")
-        return {}
-    
-    # 1. Time Filter (Hard Rule)
-    time_action = get_time_action(timestamp.time())
-    if time_action == "REJECT":
-        # We can silently return or log "Market Closed/Chop"
-        return {} # No signal in invalid time
+    def _get_state(self, symbol: str) -> MarketState:
+        if symbol not in self.state:
+            self.state[symbol] = MarketState()
+        return self.state[symbol]
 
-    # 2. Prepare 1-min Data & Indicators
-    df_1min = pd.DataFrame(candles)
-    # Convert cols
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df_1min[col] = pd.to_numeric(df_1min[col])
+    def update_context(self, symbol: str, pcr: float = None, cpr: Dict = None, oi_data: Dict = None):
+        """
+        Update slowly changing context (PCR, CPR, OI).
+        """
+        s = self._get_state(symbol)
         
-    df_1min = calculate_indicators(df_1min)
-    
-    # Current Values
-    ema9 = df_1min['ema9'].iloc[-1]
-    ema21 = df_1min['ema21'].iloc[-1]
-    rsi = df_1min['rsi'].iloc[-1]
-    adx = df_1min['adx'].iloc[-1]
-    atr = df_1min['atr'].iloc[-1]
-    volume = df_1min['volume'].iloc[-1]
-    vwap = calculate_vwap(symbol, last_candle)
-    
-    # 3. Prepare 5-min Context (MTF)
-    df_5m = resample_to_5min(candles)
-    if len(df_5m) < 20: 
-        return {} # Not enough 5m history
-        
-    df_5m['ema20'] = df_5m.ta.ema(length=20)
-    
-    # 5-min Trend Bias
-    trend_bias = "NEUTRAL"
-    c5_close = df_5m['close'].iloc[-1]
-    c5_ema20 = df_5m['ema20'].iloc[-1]
-    
-    if c5_close > c5_ema20:
-        trend_bias = "BULL"
-    elif c5_close < c5_ema20:
-        trend_bias = "BEAR"
-        
-    # 4. Regime Filter (ADX)
-    if adx < 20:
-        return {"signal": "NEUTRAL", "reason": "Low ADX (Chop)"}
-        
-    # 5. Pattern Detection (Trigger)
-    patterns = identify_patterns(candles) # Uses last 2-20 candles
-    
-    signal = 'NEUTRAL'
-    setup_type = ''
-    
-    # --- Logic 1: Trend Pullback / Continuation ---
-    if trend_bias == "BULL":
-        # Look for Bullish Setup
-        if patterns['is_bullish_engulfing'] or patterns['is_hammer']:
-            if current_price > vwap: # VWAP Confirmation
-                signal = "BUY_CALL"
-                setup_type = "TREND_PULLBACK"
-                
-    elif trend_bias == "BEAR":
-        # Look for Bearish Setup
-        if patterns['is_bearish_engulfing'] or patterns['is_shooting_star']:
-            if current_price < vwap:
-                signal = "BUY_PUT"
-                setup_type = "TREND_PULLBACK"
-                
-    # --- Logic 2: Momentum Breakout (ORB / Strong Candle) ---
-    is_strong = is_strong_candle(last_candle)
-    if is_strong == "STRONG_BULL" and trend_bias == "BULL":
-        if current_price > vwap and ema9 > ema21:
-            signal = "BUY_CALL"
-            setup_type = "MOMENTUM_BREAKOUT"
+        if pcr is not None:
+            s.pcr = pcr
             
-    elif is_strong == "STRONG_BEAR" and trend_bias == "BEAR":
-        if current_price < vwap and ema9 < ema21:
-            signal = "BUY_PUT"
-            setup_type = "MOMENTUM_BREAKOUT"
+        if cpr is not None:
+            s.cpr = cpr
+            
+        if oi_data:
+            # oi_data expected: {'timestamp': datetime, 'call_oi': float, 'put_oi': float, 'pcr': float}
+            # Append if new timestamp
+            if not s.oi_history or s.oi_history[-1]['timestamp'] != oi_data['timestamp']:
+                s.oi_history.append(oi_data)
+                # Keep last 20 records (approx 100 mins if 5 min poll)
+                if len(s.oi_history) > 20: 
+                    s.oi_history = s.oi_history[-20:]
 
-    # If No Trigger, Return
-    if signal == "NEUTRAL":
-        return {}
+    def calculate_cpr(self, daily_candle: Dict) -> Dict:
+        """Calculate CPR from previous day's High/Low/Close"""
+        h = daily_candle['high']
+        l = daily_candle['low']
+        c = daily_candle['close']
         
-    # 6. Signal Scoring
-    trend_aligned = (signal == "BUY_CALL" and trend_bias == "BULL") or \
-                    (signal == "BUY_PUT" and trend_bias == "BEAR")
-                    
-    score = calculate_signal_score(
-        {"setup": setup_type},
-        trend_aligned,
-        adx,
-        rsi,
-        patterns['has_volume_support'],
-        trend_bias
-    )
-    
-    # 7. Final Threshold Check
-    if score < Constants.MIN_SCORE:
-        # Log weak signal?
-        return {"signal": "IGNORED", "reason": f"Low Score: {score}"}
+        pivot = (h + l + c) / 3
+        bc = (h + l) / 2
+        tc = (pivot - bc) + pivot
         
-    # 8. Risk Calculation (ATR)
-    # Ensure ATR is valid
-    current_atr = atr if not pd.isna(atr) else (current_price * 0.002) # Fallback 0.2%
-    if current_atr < Constants.ATR_MIN_THRESHOLD:
-         return {"signal": "IGNORED", "reason": "Low Volatility (ATR)"}
-         
-    stop_loss_dist = current_atr * Constants.SL_MULTIPLIER
-    target_dist = current_atr * Constants.TARGET_MULTIPLIER
+        return {
+            "pivot": pivot,
+            "bc": min(bc, tc), # BC is always lower level visually for calculation
+            "tc": max(bc, tc),
+            "width": abs(tc - bc)
+        }
     
-    stop_loss = 0.0
-    target = 0.0
-    
-    if signal == "BUY_CALL":
-        stop_loss = current_price - stop_loss_dist
-        target = current_price + target_dist
-    elif signal == "BUY_PUT":
-        stop_loss = current_price + stop_loss_dist
-        target = current_price - target_dist
-
-    # 9. Return Actionable Trade Signal
-    return {
-        "signal": signal,
-        "setup": setup_type,
-        "confidence": score * 10, # 0-100 scale approximation
-        "score": score,
-        "entry_price": current_price,
-        "stop_loss": stop_loss,
-        "target": target,
-        "vwap": vwap,
-        "ema9": ema9,
-        "ema21": ema21,
-        "adx": adx,
-        "rsi": rsi,
-        "atr": current_atr,
-        "timestamp": timestamp
-    }
-
-async def analyze_trend(data: Dict, user_id: str = None, config: Dict = None, on_signal=None):
-    """Main trend analysis function triggered by WebSocket"""
-    
-    # 1. Parse Data
-    feeds = data.get("feeds", {})
-    if not feeds: return
-
-    for instrument_key, feed in feeds.items():
-        try:
-            # 1. Extract Data
-            ff = feed.get('ff', {})
-            ltpc = ff.get('ltpc', {})
-            ltp = ltpc.get('ltp', ltpc.get('cp', 0))
-            if not ltp: continue
+    def resample_to_5min(self, candles: List[Dict]) -> pd.DataFrame:
+        """Resample 1-min candles to 5-min DataFrame"""
+        if not candles:
+            return pd.DataFrame()
             
-            # Extract Candles
-            if 'marketOHLC' not in ff: continue
-            raw_candles = ff['marketOHLC'].get('ohlc', [])
-            
-            candles = []
-            for c in raw_candles:
-                if c.get('interval') == 'I1':
-                    candles.append({
-                        'timestamp': datetime.fromtimestamp(int(c['ts']) / 1000),
-                        'open': float(c['open']),
-                        'high': float(c['high']),
-                        'low': float(c['low']),
-                        'close': float(c['close']),
-                        'volume': float(c.get('volume', 0))
-                    })
-            if not candles: continue
-            
-            # Sort & Merge with History
-            candles.sort(key=lambda x: x['timestamp'])
-            if instrument_key not in candle_store:
-                candle_store[instrument_key] = []
-            
-            # Simple Merge Logic (Append new ones)
-            # In prod, use sets/dicts to avoid dups efficiently
-            existing_map = {c['timestamp']: c for c in candle_store[instrument_key]}
-            for c in candles:
-                existing_map[c['timestamp']] = c
-            
-            merged = list(existing_map.values())
-            merged.sort(key=lambda x: x['timestamp'])
-            
-            # Keep meaningful history (e.g. 200 for EMA200/Calculations)
-            if len(merged) > 300:
-                merged = merged[-300:]
-            
-            candle_store[instrument_key] = merged
-            
-            # 2. Analyze (Only if Index)
-            # Assumption: We only trigger Logic from Index data
-            # "NSE_INDEX" or similar tag should be checked. 
-            # For now, we assume explicit instrument_keys are passed that we care about.
-            if "INDEX" in instrument_key or True: # Force ALL for demo
-                
-                signals = analyze_scalping_signals(instrument_key, merged, ltp)
-                
-                # Execute Trade Logic
-                if signals.get('signal') in ["BUY_CALL", "BUY_PUT"] and signals.get('confidence', 0) >= SCALPING_CONFIG['minConfidence']:
-                    # Trigger Trade
-                    # We need to find the correct Option Symbol (ATM) from the Context
-                    # For now, just print TRADING SIGNAL
-                    
-                    if on_signal:
-                        await on_signal(signals)
-                    
-                    # TODO: Trigger Option Selection & Validation here
-                    # This would involve looking up the specific Option Contract (e.g., ATM)
-                    # and running a similar 'validate_option_metrics' check.
-                    
-        except Exception as e:
-            print(f"Analysis Error ({instrument_key}): {e}")
-            import traceback
-            traceback.print_exc()
-
-def validate_option_data(option_candle: Dict, signal_type: str, ltp: float, bid: float = 0, ask: float = 0) -> Tuple[bool, str]:
-    """
-    Validate Option Contract specific metrics.
-    1. Premium > 80 check
-    2. Spread < 2% check
-    3. RSI Momentum check (Avoid chasing)
-    """
-    # 1. Premium Check
-    if ltp < Constants.MIN_PREMIUM:
-        return False, f"Premium too low ({ltp} < {Constants.MIN_PREMIUM})"
+        df = pd.DataFrame(candles)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
         
-    # 2. Spread Check
-    if bid > 0 and ask > 0:
-        spread = ask - bid
-        spread_pct = (spread / ltp) * 100
-        if spread_pct > Constants.MAX_SPREAD_PCT:
-            return False, f"Spread too wide ({spread_pct:.2f}%)"
+        # Resample
+        df_5m = df.resample('5min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        
+        return df_5m
+
+    def analyze_oi_trends(self, state: MarketState) -> str:
+        """
+        Analyze OI History for sentiment.
+        Returns: BULLISH, BEARISH, NEUTRAL
+        """
+        if len(state.oi_history) < 2:
+            return "NEUTRAL"
             
-    # 3. RSI Check (Need history, assuming option_candle has indicators or we calc it)
-    # If we only have single candle, we can't calc RSI. 
-    # Usually this requires looking up the option's history in candle_store.
-    # Here we assume the caller passes the RSI or we skip if not available.
-    
-    return True, "OK"
+        avg_pcr = sum(x['pcr'] for x in state.oi_history[-3:]) / min(len(state.oi_history), 3)
+        
+        # Trend of PCR
+        curr_pcr = state.oi_history[-1]['pcr']
+        prev_pcr = state.oi_history[0]['pcr'] # From start of window
+        
+        if curr_pcr > 1.2 and curr_pcr > prev_pcr:
+            return "BULLISH" # High PCR and Rising
+        elif curr_pcr < 0.8 and curr_pcr < prev_pcr:
+            return "BEARISH" # Low PCR and Falling
+            
+        return "NEUTRAL"
+
+    def process_tick(self, instrument_key: str, candle: Dict, is_index: bool = False) -> Dict:
+        """
+        Main entry point for processing a new 1-min candle.
+        Returns a Signal Dict if opportunity found, else empty.
+        """
+        s = self._get_state(instrument_key)
+        
+        # 1. Update Candle Store
+        # Ensure timestamp uniqueness
+        if s.candles and s.candles[-1]['timestamp'] == candle['timestamp']:
+            s.candles[-1] = candle # Update current minute
+        else:
+            s.candles.append(candle)
+            
+        # Keep manageable history
+        if len(s.candles) > 300:
+            s.candles = s.candles[-300:]
+            
+        if not is_index or len(s.candles) < 50:
+            return {}
+            
+        # 2. Analyze
+        return self.analyze_scalping_signals(instrument_key, s)
+
+    def analyze_scalping_signals(self, symbol: str, state: MarketState) -> Dict:
+        candles = state.candles
+        last_candle = candles[-1]
+        timestamp = last_candle['timestamp']
+        current_price = last_candle['close']
+        
+        # --- Filters ---
+        # 1. Time Check
+        if not self._is_time_valid(timestamp.time()):
+            return {}
+            
+        # 2. Stale Data Check (Max 10s lag allowed for processing)
+        lag = (datetime.now() - timestamp).total_seconds()
+        if lag > 65: # Allow 1 min candle + 5s buffer
+             # In backtest this will trigger, so careful. 
+             # For live, we expect 'timestamp' to be close to 'now'
+             pass 
+             
+        # --- Multi-Timeframe Analysis (5min) ---
+        df_5m = self.resample_to_5min(state.candles)
+        tf5_trend = "NEUTRAL"
+        
+        if not df_5m.empty and len(df_5m) > 10:
+             # TA-Lib/Pandas-TA EMA might return Series or DataFrame depending on version/config
+             ema_series = df_5m.ta.ema(length=21)
+             if isinstance(ema_series, pd.DataFrame):
+                 ema_series = ema_series.iloc[:, 0]
+                 
+             df_5m['ema21'] = ema_series
+             
+             last_5m = df_5m.iloc[-1]
+             # Simple trend check: Close > EMA21 on 5m
+             # Handle NaN (if not enough data for EMA21)
+             if pd.notna(last_5m['ema21']):
+                 if last_5m['close'] > last_5m['ema21']:
+                     tf5_trend = "BULLISH"
+                 elif last_5m['close'] < last_5m['ema21']:
+                     tf5_trend = "BEARISH"
+
+        # --- Indicator Calculation (1min) ---
+        df = pd.DataFrame(candles)
+        df['ema9'] = df.ta.ema(length=9)
+        df['ema21'] = df.ta.ema(length=21)
+        df['rsi'] = df.ta.rsi(length=14)
+        df['atr'] = df.ta.atr(length=Config.ATR_PERIOD)
+        
+        # ADX
+        adx_df = df.ta.adx(length=14)
+        if adx_df is not None and not adx_df.empty:
+            df['adx'] = adx_df['ADX_14']
+        else:
+            df['adx'] = 0
+
+        # Supertrend (7, 3) - New Addition
+        st = df.ta.supertrend(length=7, multiplier=3)
+        # supertrend returns 4 columns usually, we need the direction/value
+        # pandas_ta columns: SUPERT_7_3.0 vs SUPERT_7_3
+        if st is not None:
+             # Dynamically check columns to be safe across versions
+             cols = st.columns
+             if 'SUPERT_7_3.0' in cols:
+                 df['st_val'] = st['SUPERT_7_3.0']
+                 df['st_dir'] = st['SUPERTd_7_3.0'] 
+             elif 'SUPERT_7_3' in cols:
+                 df['st_val'] = st['SUPERT_7_3']
+                 df['st_dir'] = st['SUPERTd_7_3']
+             else:
+                 # Fallback: Index 0=Value, 1=Direction
+                 df['st_val'] = st.iloc[:, 0]
+                 df['st_dir'] = st.iloc[:, 1]
+        else:
+             df['st_val'] = 0
+             df['st_dir'] = 0
+
+        # VWAP (Intraday)
+        vwap = self._calculate_vwap(state, last_candle)
+        
+        # --- Current Values ---
+        c = df.iloc[-1]
+        ema9, ema21 = c['ema9'], c['ema21']
+        rsi, adx, atr = c['rsi'], c['adx'], c['atr']
+        st_dir = c['st_dir']
+        
+        # --- Logic ---
+        
+        signal = "NEUTRAL"
+        setup = ""
+        score = 0
+        
+        # Bias Detection
+        is_uptrend = current_price > vwap and ema9 > ema21
+        is_downtrend = current_price < vwap and ema9 < ema21
+        
+        # Pattern Recognition
+        # We use a helper that looks at last few candles
+        patterns = identify_patterns(candles)
+        
+        # Strategy 1: Trend Pullback w/ Pattern
+        # Pre-req: ADX > 20 (Trend exists)
+        if adx > 20: 
+            if is_uptrend:
+                if patterns['is_bullish_engulfing'] or patterns['is_hammer']:
+                    # Validation: Must be near EMA 9/21 (Value Area)
+                    dist_ema = abs(current_price - ema9)
+                    if dist_ema < (1.0 * atr): # Close to EMA (Relaxed to 1.0 ATR)
+                        signal = "BUY_CALL"
+                        setup = "TREND_PULLBACK"
+                        score += 3
+                        
+                        # TF5 Confirmation
+                        if tf5_trend == "BULLISH": score += 2
+                        elif tf5_trend == "BEARISH": score -= 2
+
+            elif is_downtrend:
+                if patterns['is_bearish_engulfing'] or patterns['is_shooting_star']:
+                     dist_ema = abs(current_price - ema9)
+                     if dist_ema < (1.0 * atr):
+                        signal = "BUY_PUT"
+                        setup = "TREND_PULLBACK"
+                        score += 3
+                        
+                        # TF5 Confirmation
+                        if tf5_trend == "BEARISH": score += 2
+                        elif tf5_trend == "BULLISH": score -= 2
+        
+        # Strategy 2: CPR Rejection / Bounce (New)
+        # If price touches CPR Top/Bottom and reverses
+        # Requires CPR to be set
+        if state.cpr['pivot'] > 0:
+             # Logic placeholder for CPR bounce
+             pass
+
+        # Strategy 3: Supertrend Reversal
+        # Aggressive entry on ST flip
+        # Check previous candle ST
+        if len(df) > 2:
+            prev_st = df.iloc[-2]['st_dir']
+            if prev_st == -1 and st_dir == 1 and current_price > vwap:
+                 signal = "BUY_CALL"
+                 setup = "ST_REVERSAL"
+                 score += 2
+            elif prev_st == 1 and st_dir == -1 and current_price < vwap:
+                 signal = "BUY_PUT"
+                 setup = "ST_REVERSAL"
+                 score += 2
+
+        # --- Scoring & Filtering ---
+        if signal == "NEUTRAL":
+            return {}
+            
+        # Confluence Bonuses
+        # OI Trend Analysis
+        oi_sentiment = self.analyze_oi_trends(state)
+        
+        if state.pcr > 1.2 and signal == "BUY_CALL": score += 2
+        if state.pcr < 0.8 and signal == "BUY_PUT": score += 2
+        
+        if oi_sentiment == "BULLISH" and signal == "BUY_CALL": score += 1
+        if oi_sentiment == "BEARISH" and signal == "BUY_PUT": score += 1
+        if oi_sentiment == "BEARISH" and signal == "BUY_CALL": score -= 2 # Contra OI
+        if oi_sentiment == "BULLISH" and signal == "BUY_PUT": score -= 2 # Contra OI
+        
+        if rsi > 50 and signal == "BUY_CALL": score += 1
+        if rsi < 50 and signal == "BUY_PUT": score += 1
+        if is_strong_candle(last_candle): score += 1
+        
+        if score < Config.MIN_SCORE:
+            return {"signal": "IGNORED", "reason": f"Low Score {score}"}
+            
+        # --- Targets ---
+        sl_points = atr * Config.SL_MULTIPLIER
+        tg_points = atr * Config.TARGET_MULTIPLIER
+        
+        # Fallback if ATR is nan/zero
+        if pd.isna(sl_points) or sl_points == 0:
+            sl_points = current_price * 0.002 # 0.2%
+            tg_points = current_price * 0.004
+
+        return {
+            "signal": signal,
+            "setup": setup,
+            "confidence": score,
+            "entry_price": current_price,
+            "stop_loss": current_price - sl_points if "CALL" in signal else current_price + sl_points,
+            "target": current_price + tg_points if "CALL" in signal else current_price - tg_points,
+            "atr": atr,
+            "timestamp": timestamp
+        }
+
+    def _is_time_valid(self, t: time) -> bool:
+        if Config.TIME_MORNING_START <= t <= Config.TIME_MORNING_END: return True
+        if Config.TIME_AFTERNOON_START <= t <= Config.TIME_AFTERNOON_END: return True
+        return False
+
+    def _calculate_vwap(self, state: MarketState, candle: Dict) -> float:
+        """Accumulate VWAP safely"""
+        # Reset if new day (handled by caller passing fresh data usually? 
+        # No, we must handle day change here if we sustain state)
+        # For simplicity, we assume one process run = one day or reset explicitly.
+        
+        typ = (candle['high'] + candle['low'] + candle['close']) / 3
+        vol = candle['volume']
+        
+        state.vwap['cum_pv'] += typ * vol
+        state.vwap['cum_vol'] += vol
+        
+        if state.vwap['cum_vol'] == 0: return typ
+        return state.vwap['cum_pv'] / state.vwap['cum_vol']

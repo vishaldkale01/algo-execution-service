@@ -90,6 +90,8 @@ class MarketDataService:
                 total_put_oi += puts[strike]['market_data'].get('oi', 0)
 
         strike_metadata['pcr'] = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+        strike_metadata['total_call_oi'] = total_call_oi
+        strike_metadata['total_put_oi'] = total_put_oi
 
         # Extract specific keys for subscription
         for strike in target_strikes:
@@ -144,20 +146,64 @@ class MarketDataService:
                         if instrument_key in feed_data:
                             return feed_data[instrument_key]['last_price']
                         
-                        # 2. Try URL encoded/decoded variations if mismatch
-                        # Sometimes keys come back slightly different (spaces vs %20)
+                        # 2. Try fuzzy matching (separators | vs : and spaces)
                         for key, details in feed_data.items():
-                            if key == instrument_key or key.replace(' ', '%20') == instrument_key.replace(' ', '%20'):
-                                print(f"⚠️ Key mismatch handled: Requested '{instrument_key}', Found '{key}'")
+                            # Normalize: treat | and : as same, spaces as %20
+                            k_norm = key.replace('|', ':').replace(' ', '%20')
+                            i_norm = instrument_key.replace('|', ':').replace(' ', '%20')
+                            
+                            if k_norm == i_norm:
+                                print(f"[WARN] Key mismatch handled: Requested '{instrument_key}', Found '{key}'")
                                 return details['last_price']
                                 
                         # 3. Debug if still not found
-                        print(f"❌ Market Status: Key '{instrument_key}' not found in response keys: {list(feed_data.keys())}")
-                        print(f"📄 Full Response: {data}")
+                        print(f"[ERROR] Market Status: Key '{instrument_key}' not found in response keys: {list(feed_data.keys())}")
+                        print(f"[DEBUG] Full Response: {data}")
                         
                     else:
-                        print(f"❌ Market Status: 'data' field missing in response: {data}")
+                        print(f"[ERROR] Market Status: 'data' field missing in response: {data}")
 
             except Exception as e:
-                print(f"❌ Exception fetching market status: {e}")
+                print(f"[ERROR] Exception fetching market status: {e}")
         return 0.0
+
+    async def fetch_historical_data(self, instrument_key: str, interval: str = "1minute", days: int = 5) -> List[Dict]:
+        """
+        Fetch historical candles to warm up indicators.
+        interval: 1minute, 5minute, 30minute, day
+        """
+        # Calculate to_date and from_date
+        to_date = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        
+        url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+        
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, headers={"Accept": "application/json"})
+                if response.status_code == 200:
+                    data = response.json()
+                    if "data" in data and "candles" in data["data"]:
+                        # Convert to standard format
+                        candles = []
+                        for c in data["data"]["candles"]:
+                            # Upstox Format: [timestamp, open, high, low, close, volume, oi]
+                            candles.append({
+                                'timestamp': datetime.fromisoformat(c[0]),
+                                'open': float(c[1]),
+                                'high': float(c[2]),
+                                'low': float(c[3]),
+                                'close': float(c[4]),
+                                'volume': float(c[5])
+                            })
+                        # Sort by timestamp ascending
+                        candles.sort(key=lambda x: x['timestamp'])
+                        print(f"[INFO] Fetched {len(candles)} historical candles for {instrument_key}")
+                        return candles
+                
+                print(f"[WARN] Failed to fetch history: {response.status_code} - {response.text}")
+                return []
+                
+            except Exception as e:
+                print(f"[ERROR] Exception fetching history: {e}")
+                return []

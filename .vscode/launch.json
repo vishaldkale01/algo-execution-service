@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: Debug Algo Worker",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "app.main",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python: Debug Trigger Script",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_start_trading.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

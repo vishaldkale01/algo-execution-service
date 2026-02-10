@@ -2,59 +2,17 @@ from datetime import datetime
 from typing import Dict, Tuple, Optional
 from app.models.trade import VirtualTrade, TradeStatus, TradeType
 
-class DailyRiskMonitor:
-    def __init__(self, max_trades: int = 5, max_loss_amt: float = 2000.0):
-        self.max_trades = max_trades
-        self.max_loss_amt = max_loss_amt
-        self.current_date = datetime.now().date()
-        self.trades_taken = 0
-        self.daily_pnl = 0.0
-        self.is_locked = False
-        self.last_trade_time = None
-        self.last_trade_result = "WIN" # WIN/LOSS
-
-    def check_new_day(self):
-        if datetime.now().date() > self.current_date:
-            self.current_date = datetime.now().date()
-            self.trades_taken = 0
-            self.daily_pnl = 0.0
-            self.is_locked = False
-            print("🔄 Daily Risk Monitor Reset for New Day")
-
-    def can_trade(self) -> Tuple[bool, str]:
-        self.check_new_day()
-        
-        if self.is_locked:
-            return False, "Daily Limit Breached (Locked)"
-            
-        if self.trades_taken >= self.max_trades:
-            return False, f"Max Trades Reached ({self.trades_taken}/{self.max_trades})"
-            
-        if self.daily_pnl <= -self.max_loss_amt:
-             return False, f"Max Daily Loss Reached ({self.daily_pnl})"
-             
-        return True, "OK"
-
-    def record_trade(self, pnl: float):
-        self.trades_taken += 1
-        self.daily_pnl += pnl
-        self.last_trade_time = datetime.now()
-        
-        if pnl < 0:
-            self.last_trade_result = "LOSS"
-        else:
-             self.last_trade_result = "WIN"
-             
-        if self.daily_pnl <= -self.max_loss_amt:
-            self.is_locked = True
-            print(f"STOP DAILY STOP LOSS HIT: {self.daily_pnl}")
-
 class ActiveTradeContext:
-    def __init__(self, trade: VirtualTrade, atr: float, sl: float, target: float):
+    def __init__(self, trade: VirtualTrade, atr: float, sl: float, target: float, entry_order_id: str = None):
         self.trade = trade
         self.atr = atr
         self.current_sl = sl
         self.target = target
+        
+        # Order Tracking
+        self.entry_order_id = entry_order_id
+        self.sl_order_id: Optional[str] = None
+        self.exit_order_id: Optional[str] = None
         
         # State
         self.highest_mfe = 0.0 # Max Favorable Excursion (Points)
