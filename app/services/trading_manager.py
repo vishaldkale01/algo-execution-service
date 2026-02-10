@@ -12,6 +12,7 @@ from app.models.trade import VirtualTrade, TradeType, TradeStatus
 
 from app.services.order_execution_service import OrderExecutionService
 from app.services.audit_logger import AuditLogger
+from app.services.ai_validator import AIValidator
 
 class UserTrader:
     def __init__(self, user_id: str, access_token: str, config: dict):
@@ -35,6 +36,7 @@ class UserTrader:
         # Managers
         self.risk_engine = RiskEngine(user_id, max_trades=5, max_loss_amt=2500)
         self.analyzer = TrendAnalyzer(user_id)
+        self.ai_validator = AIValidator()
         self.active_trade: Optional[ActiveTradeContext] = None
 
     async def on_market_data(self, message):
@@ -160,6 +162,38 @@ class UserTrader:
         if not can_trade:
              print(f"[WARN] Signal REJECTED (Risk): {signal['signal']} | Reason: {reason}")
              return
+             
+        # AI Validation (Optional)
+        if self.config.get("USE_AI_VALIDATION", False):
+            print(f"[AI] Requesting Validation for {signal['signal']}...")
+            # Prepare context for AI
+            symbol_index = "NSE_INDEX|Nifty Bank" # Default for now
+            state = self.analyzer._get_state(symbol_index)
+            
+            # Get last 20 candles for context
+            recent = state.candles[-20:] if state else []
+            
+            ai_context = {
+                "instrument": "Bank Nifty",
+                "signal_data": signal,
+                "recent_candles": [
+                    {"time": c['timestamp'].strftime("%H:%M"), "c": c['close'], "v": c['volume']} 
+                    for c in recent
+                ],
+                "adx": signal.get('adx'),
+                "pattern": signal.get('setup')
+            }
+            
+            is_ok, ai_reason = await self.ai_validator.validate_signal(ai_context)
+            if not is_ok:
+                print(f"[AI_VETO] Signal Rejected by AI: {ai_reason}")
+                await self.audit_log.log("AI_SIGNAL_VETO", level="WARN", details={
+                    "signal": signal,
+                    "reason": ai_reason
+                })
+                return
+            else:
+                print(f"[AI_PASS] AI Approved signal: {ai_reason}")
         
         # 1. Identify Option Strike (ATM)
         # We need to pick the right option based on 'signal' (BUY_CALL / BUY_PUT)
